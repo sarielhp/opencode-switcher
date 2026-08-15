@@ -7,10 +7,10 @@ A simple Ruby script to switch between different [OpenCode](https://opencode.ai)
 OpenCode stores its active configuration in `~/.config/opencode/opencode.json`. When working across multiple providers (e.g., OpenRouter, local Ollama/vLLM endpoints, cloud APIs, or private clusters), updating credentials and JSON configurations manually can be repetitive.
 
 `opencode-switcher` provides:
-- Profile isolation under `~/.config/opencode_switch/<number>/` (containing `config.json` and `API_key.sh`).
+- Profile isolation under `~/.config/opencode-switcher/<number>/` (containing `config.json` and `API_key.sh`).
 - A single wrapper command `oc` to run OpenCode using any profile.
 - A subcommand `oc conf` to inspect, switch, test, and benchmark profiles.
-- Backwards compatibility via `opencode-switch`.
+- Command alias `opencode-switcher` for direct profile management.
 
 ---
 
@@ -32,7 +32,7 @@ Copy `oc` to a directory in your `PATH` (such as `~/.local/bin`) and make it exe
 mkdir -p ~/.local/bin
 cp oc ~/.local/bin/oc
 chmod +x ~/.local/bin/oc
-ln -sf oc ~/.local/bin/opencode-switch
+ln -sf oc ~/.local/bin/opencode-switcher
 ```
 
 Ensure `~/.local/bin` is in your shell `PATH`:
@@ -45,10 +45,10 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Profile Directory Structure
 
-Profiles are stored in `~/.config/opencode_switch/`:
+Profiles are stored in `~/.config/opencode-switcher/`:
 
 ```
-~/.config/opencode_switch/
+~/.config/opencode-switcher/
 ├── default.json          # Tracks active default profile number (e.g. {"default": "01"})
 ├── 01/
 │   ├── config.json       # OpenCode JSON configuration for Profile 01
@@ -110,7 +110,7 @@ oc conf list
 
 Example output:
 ```
-OpenCode Profiles (~/.config/opencode_switch/):
+OpenCode Profiles (~/.config/opencode-switcher/):
     01           "OpenRouter DeepSeek direct" — Provider: openrouter [OPENROUTER_API_KEY: SET]
        Model: openrouter/deepseek/deepseek-v4-flash | URL: https://openrouter.ai/api/v1
 
