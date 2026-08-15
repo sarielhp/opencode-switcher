@@ -1,0 +1,1273 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'json'
+require 'open3'
+require 'net/http'
+require 'uri'
+
+SWITCH_DIR   = File.expand_path('~/.config/opencode_switch')
+DEFAULT_FILE = File.join(SWITCH_DIR, 'default.json')
+OPENCODE_DIR = File.expand_path('~/.config/opencode')
+TARGET_CFG   = File.join(OPENCODE_DIR, 'opencode.json')
+TARGET_JSONC = File.join(OPENCODE_DIR, 'opencode.jsonc')
+
+FileUtils.mkdir_p(SWITCH_DIR)
+FileUtils.mkdir_p(OPENCODE_DIR)
+
+# ANSI terminal formatting
+def colorize(text, code)
+  $stdout.tty? ? "\e[#{code}m#{text}\e[0m" : text
+end
+
+def green(t);  colorize(t, 32); end
+def cyan(t);   colorize(t, 36); end
+def yellow(t); colorize(t, 33); end
+def red(t);    colorize(t, 31); end
+def bold(t);   colorize(t, 1);  end
+
+# Check if an argument is a help flag (e.g. help, -?, /?, /h, /H, -h, -H, --help, etc.)
+def help_arg?(arg)
+  return false if arg.nil?
+  arg.to_s.strip =~ /^([-\/+]{1,2}(h|help|\?)|help|\?)$/i
+end
+
+# Format profile number into 2-digit format ("1" -> "01", "02" -> "02")
+def format_num(num_str)
+  num = num_str.to_s.strip.to_i
+  return nil if num <= 0
+  format('%02d', num)
+end
+
+# List all profile numbers (e.g. ["01", "02", ...])
+def available_profile_nums
+  Dir.glob(File.join(SWITCH_DIR, '[0-9]*'))
+     .select { |p| File.directory?(p) }
+     .map { |p| File.basename(p) }
+     .sort
+end
+
+# Get current default profile number from default.json
+def get_default_profile
+  if File.exist?(DEFAULT_FILE)
+    begin
+      data = JSON.parse(File.read(DEFAULT_FILE))
+      return format_num(data['default']) if data['default']
+    rescue StandardError
+      # Ignore read errors
+    end
+  end
+  available_profile_nums.first
+end
+
+# Set default profile number in default.json and copy config.json to ~/.config/opencode/opencode.json
+def set_default_profile(num_str)
+  num = format_num(num_str)
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    warn "Available profiles: #{available_profile_nums.join(', ')}"
+    exit 1
+  end
+
+  File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
+
+  # Copy config to active OpenCode location
+  cfg_src = File.join(profile_dir, 'config.json')
+  if File.exist?(cfg_src)
+    FileUtils.rm_f(TARGET_CFG)
+    FileUtils.rm_f(TARGET_JSONC)
+    FileUtils.cp(cfg_src, TARGET_CFG)
+  end
+
+  puts green("✓ Default profile set to #{bold(num)}")
+end
+
+# Inspect JSON config structure to find API environment variable names
+def detect_api_env_vars(json_data)
+  vars = []
+
+  search_obj = lambda do |obj, provider_name|
+    if obj.is_a?(Hash)
+      obj.each do |k, v|
+        if k == 'provider' && v.is_a?(Hash)
+          v.each do |p_name, p_val|
+            search_obj.call(p_val, p_name)
+          end
+        elsif k.to_s =~ /apiKey/i
+          if v.is_a?(String)
+            if v =~ /\{env:([^}]+)\}/
+              vars << $1.strip
+            elsif v =~ /^\$([A-Za-z0-9_]+)$/
+              vars << $1.strip
+            elsif provider_name
+              var_name = "#{provider_name.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+              vars << var_name
+            else
+              vars << 'API_KEY'
+            end
+          end
+        else
+          search_obj.call(v, provider_name)
+        end
+      end
+    elsif obj.is_a?(Array)
+      obj.each { |item| search_obj.call(item, provider_name) }
+    end
+  end
+
+  search_obj.call(json_data, nil)
+
+  if vars.empty? && json_data.is_a?(Hash) && json_data['provider'].is_a?(Hash)
+    json_data['provider'].keys.each do |p_name|
+      vars << "#{p_name.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+    end
+  end
+
+  vars.uniq
+end
+
+# Ensure JSON config uses {env:VAR_NAME} placeholders for apiKey fields
+def inject_env_placeholders!(json_data, env_var_map)
+  update_obj = lambda do |obj, provider_name|
+    if obj.is_a?(Hash)
+      obj.each do |k, v|
+        if k == 'provider' && v.is_a?(Hash)
+          v.each do |p_name, p_val|
+            update_obj.call(p_val, p_name)
+          end
+        elsif k.to_s =~ /apiKey/i && v.is_a?(String)
+          if v !~ /\{env:[^}]+\}/
+            var = env_var_map[provider_name] || "#{provider_name.to_s.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+            obj[k] = "{env:#{var}}"
+          end
+        else
+          update_obj.call(v, provider_name)
+        end
+      end
+    elsif obj.is_a?(Array)
+      obj.each { |item| update_obj.call(item, provider_name) }
+    end
+  end
+
+  update_obj.call(json_data, nil)
+end
+
+# Check and perform first-time setup
+def ensure_initialized
+  profiles = available_profile_nums
+  return unless profiles.empty?
+
+  puts yellow("Initializing OpenCode Switch for the first time...")
+  profile_1_dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(profile_1_dir)
+
+  initial_cfg = TARGET_CFG
+  if !File.exist?(initial_cfg)
+    fallback = File.join(OPENCODE_DIR, 'old', 'opencode.json')
+    initial_cfg = fallback if File.exist?(fallback)
+  end
+
+  if File.exist?(initial_cfg)
+    content = File.read(initial_cfg)
+    json_data = JSON.parse(content) rescue {}
+
+    # Detect env vars and check if literal API keys are present
+    env_vars = detect_api_env_vars(json_data)
+    env_var_map = {}
+    literal_key = nil
+
+    if json_data['provider'].is_a?(Hash)
+      json_data['provider'].each do |p_name, p_val|
+        if p_val.is_a?(Hash) && p_val['options'].is_a?(Hash) && p_val['options']['apiKey']
+          key_val = p_val['options']['apiKey'].to_s
+          if key_val !~ /\{env:[^}]+\}/ && !key_val.empty?
+            literal_key = key_val
+          end
+        end
+        env_var_map[p_name] = "#{p_name.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+      end
+    end
+
+    inject_env_placeholders!(json_data, env_var_map) if literal_key
+    File.write(File.join(profile_1_dir, 'config.json'), JSON.pretty_generate(json_data))
+
+    primary_var = env_vars.first || 'OPENROUTER_API_KEY'
+    key_to_set = literal_key || ENV[primary_var] || ''
+
+    script_content = <<~SH
+      #!/usr/bin/env bash
+      # API Key configuration for Profile 01
+      export #{primary_var}="#{key_to_set}"
+    SH
+
+    api_script = File.join(profile_1_dir, 'API_key.sh')
+    File.write(api_script, script_content)
+    FileUtils.chmod(0755, api_script)
+    File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => '01' }))
+    puts green("✓ Created Profile 01 from existing OpenCode config (#{initial_cfg})")
+  else
+    default_config = {
+      "$schema" => "https://opencode.ai/config.json",
+      "model" => "openrouter/deepseek/deepseek-v4-flash",
+      "provider" => {
+        "openrouter" => {
+          "npm" => "@ai-sdk/openai-compatible",
+          "name" => "OpenRouter",
+          "options" => {
+            "baseURL" => "https://openrouter.ai/api/v1",
+            "apiKey" => "{env:OPENROUTER_API_KEY}"
+          }
+        }
+      }
+    }
+    File.write(File.join(profile_1_dir, 'config.json'), JSON.pretty_generate(default_config))
+    api_script = File.join(profile_1_dir, 'API_key.sh')
+    File.write(api_script, "#!/usr/bin/env bash\nexport OPENROUTER_API_KEY=\"\"\n")
+    FileUtils.chmod(0755, api_script)
+    File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => '01' }))
+    puts green("✓ Created initial Profile 01")
+  end
+end
+
+# List all available profiles
+def list_profiles
+  ensure_initialized
+  profiles = available_profile_nums
+  default_num = get_default_profile
+
+  puts bold("OpenCode Profiles (~/.config/opencode_switch/):")
+  profiles.each_with_index do |p_num, idx|
+    is_default = (p_num == default_num)
+    indicator = is_default ? green("  * #{p_num} [default]") : "    #{p_num}          "
+
+    p_dir = File.join(SWITCH_DIR, p_num)
+    cfg_file = File.join(p_dir, 'config.json')
+    api_file = File.join(p_dir, 'API_key.sh')
+
+    model = '(no default model)'
+    provider = '(none)'
+    description = nil
+    base_url = nil
+
+    if File.exist?(cfg_file)
+      begin
+        data = JSON.parse(File.read(cfg_file))
+        model = data['model'] || '(no default model)'
+        description = data['description']
+        if data['provider'].is_a?(Hash) && !data['provider'].empty?
+          provider = data['provider'].keys.join(', ')
+          first_p = data['provider'].values.first
+          if first_p.is_a?(Hash) && first_p['options'].is_a?(Hash)
+            base_url = first_p['options']['baseURL']
+          end
+        end
+      rescue StandardError
+        model = '(invalid json)'
+      end
+    end
+
+    # Check API key status in API_key.sh
+    key_info = ''
+    if File.exist?(api_file)
+      api_content = File.read(api_file)
+      var_matches = api_content.scan(/export\s+([A-Za-z0-9_]+)=["']?([^"'\n]*)["']?/)
+      if var_matches.any?
+        var_summaries = var_matches.map do |var, val|
+          val_display = val.strip.empty? ? red('EMPTY') : green('SET')
+          "#{var}: #{val_display}"
+        end
+        key_info = "[#{var_summaries.join(', ')}]"
+      else
+        key_info = "[#{yellow('No export in API_key.sh')}]"
+      end
+    else
+      key_info = "[#{red('Missing API_key.sh')}]"
+    end
+
+    desc_label = description ? " #{bold(cyan("\"#{description}\""))} —" : ""
+    line1 = "#{indicator}#{desc_label} #{yellow("Provider: #{provider}")} #{key_info}"
+    url_part = base_url ? " | URL: #{base_url}" : ""
+    line2 = "       #{cyan("Model: #{model}")}#{url_part}"
+
+    puts "" if idx > 0
+    puts line1
+    puts line2
+  end
+end
+
+# Set description for a profile
+def set_profile_description(num_str, desc_text)
+  ensure_initialized
+  num = format_num(num_str) || get_default_profile
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    exit 1
+  end
+
+  cfg_file = File.join(profile_dir, 'config.json')
+  unless File.exist?(cfg_file)
+    warn red("Error: config.json not found in #{profile_dir}")
+    exit 1
+  end
+
+  data = JSON.parse(File.read(cfg_file)) rescue nil
+  unless data
+    warn red("Error: Invalid JSON in #{cfg_file}")
+    exit 1
+  end
+
+  data['description'] = desc_text
+  File.write(cfg_file, JSON.pretty_generate(data))
+
+  if num == get_default_profile
+    FileUtils.rm_f(TARGET_CFG)
+    FileUtils.cp(cfg_file, TARGET_CFG)
+  end
+
+  puts green("✓ Updated description for Profile #{bold(num)} to: #{bold(cyan(desc_text))}")
+end
+
+# Create a new profile from a JSON file
+def create_profile(json_path)
+  ensure_initialized
+  unless File.exist?(json_path)
+    warn red("Error: Config file '#{json_path}' does not exist.")
+    exit 1
+  end
+
+  raw_content = File.read(json_path)
+  json_data = JSON.parse(raw_content) rescue nil
+  unless json_data
+    warn red("Error: File '#{json_path}' is not valid JSON.")
+    exit 1
+  end
+
+  existing_nums = available_profile_nums.map(&:to_i)
+  next_int = (existing_nums.max || 0) + 1
+  next_num = format('%02d', next_int)
+
+  profile_dir = File.join(SWITCH_DIR, next_num)
+  FileUtils.mkdir_p(profile_dir)
+
+  env_vars = detect_api_env_vars(json_data)
+  env_var_map = {}
+  literal_key = nil
+
+  if json_data['provider'].is_a?(Hash)
+    json_data['provider'].each do |p_name, p_val|
+      if p_val.is_a?(Hash) && p_val['options'].is_a?(Hash) && p_val['options']['apiKey']
+        key_val = p_val['options']['apiKey'].to_s
+        if key_val !~ /\{env:[^}]+\}/ && !key_val.empty?
+          literal_key = key_val
+        end
+      end
+      env_var_map[p_name] = "#{p_name.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+    end
+  end
+
+  inject_env_placeholders!(json_data, env_var_map)
+
+  dest_cfg = File.join(profile_dir, 'config.json')
+  File.write(dest_cfg, JSON.pretty_generate(json_data))
+
+  primary_var = env_vars.first || 'API_KEY'
+  key_to_set = literal_key || ''
+
+  api_script_content = <<~SH
+    #!/usr/bin/env bash
+    # API key environment configuration for Profile #{next_num}
+    export #{primary_var}="#{key_to_set}"
+  SH
+
+  dest_api = File.join(profile_dir, 'API_key.sh')
+  File.write(dest_api, api_script_content)
+  FileUtils.chmod(0755, dest_api)
+
+  puts green("✓ Created Profile #{bold(next_num)} in #{profile_dir}")
+  puts "  Config:  #{dest_cfg}"
+  puts "  API Key: #{dest_api} (#{primary_var}: #{key_to_set.empty? ? yellow('empty') : green('configured')})"
+
+  if key_to_set.empty?
+    puts "\nTo set the API key for this profile, run:"
+    puts "  #{cyan("oc conf #{next_num} set_api \"<YOUR_API_KEY>\"")}"
+  end
+end
+
+# Set API key for a profile
+def set_api_key(num_str, api_key_value)
+  ensure_initialized
+  num = format_num(num_str)
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    exit 1
+  end
+
+  api_file = File.join(profile_dir, 'API_key.sh')
+  cfg_file = File.join(profile_dir, 'config.json')
+
+  var_name = nil
+  if File.exist?(api_file)
+    content = File.read(api_file)
+    if content =~ /export\s+([A-Za-z0-9_]+)=/
+      var_name = $1
+    end
+  end
+
+  if var_name.nil? && File.exist?(cfg_file)
+    json_data = JSON.parse(File.read(cfg_file)) rescue {}
+    var_name = detect_api_env_vars(json_data).first
+  end
+
+  var_name ||= 'API_KEY'
+
+  script_content = <<~SH
+    #!/usr/bin/env bash
+    # API key environment configuration for Profile #{num}
+    export #{var_name}="#{api_key_value}"
+  SH
+
+  File.write(api_file, script_content)
+  FileUtils.chmod(0755, api_file)
+
+  if File.exist?(cfg_file)
+    json_data = JSON.parse(File.read(cfg_file)) rescue nil
+    if json_data
+      inject_env_placeholders!(json_data, { nil => var_name })
+      File.write(cfg_file, JSON.pretty_generate(json_data))
+    end
+  end
+
+  puts green("✓ Updated #{bold(var_name)} for Profile #{bold(num)}")
+end
+
+# Mask API key for display
+def mask_key(key)
+  return red('[NOT SET / EMPTY]') if key.nil? || key.strip.empty?
+  key = key.strip
+  return '••••••••' if key.length < 10
+  "#{key[0..7]}...#{key[-4..-1]}"
+end
+
+# Detailed profile information viewer
+def show_profile_info(num_str = nil)
+  ensure_initialized
+  num = format_num(num_str) || get_default_profile
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    warn "Available profiles: #{available_profile_nums.join(', ')}"
+    exit 1
+  end
+
+  cfg_file = File.join(profile_dir, 'config.json')
+  api_file = File.join(profile_dir, 'API_key.sh')
+  default_num = get_default_profile
+  is_default = (num == default_num)
+
+  puts bold("==================================================")
+  puts bold("  OpenCode Profile Details: #{cyan(num)} #{is_default ? green('[ACTIVE DEFAULT]') : ''}")
+  puts bold("==================================================")
+  puts "Directory:       #{profile_dir}"
+  puts "Config file:     #{cfg_file}"
+  puts "API Key script:  #{api_file}"
+  puts ""
+
+  puts bold("Environment & API Keys (from API_key.sh):")
+  if File.exist?(api_file)
+    api_content = File.read(api_file)
+    var_matches = api_content.scan(/export\s+([A-Za-z0-9_]+)=["']?([^"'\n]*)["']?/)
+    if var_matches.any?
+      var_matches.each do |var, val|
+        masked = mask_key(val)
+        status = val.strip.empty? ? red('EMPTY') : green('CONFIGURED')
+        puts "  • #{bold(var)}: #{masked} (#{status})"
+      end
+    else
+      puts "  #{yellow('No export statements found in API_key.sh')}"
+    end
+  else
+    puts "  #{red('Missing API_key.sh file')}"
+  end
+  puts ""
+
+  if File.exist?(cfg_file)
+    begin
+      data = JSON.parse(File.read(cfg_file))
+      
+      puts bold("Model Configuration:")
+      puts "  • Description:   #{bold(cyan(data['description']))}" if data['description']
+      puts "  • Default Model: #{cyan(data['model'] || '(not set)')}"
+      puts "  • Small Model:   #{cyan(data['small_model'] || '(not set)')}" if data['small_model']
+      puts "  • Instructions:  #{data['instructions'].inspect}" if data['instructions']
+      puts ""
+
+      puts bold("Providers & Access Points (Base URLs):")
+      providers = data['provider']
+      if providers.is_a?(Hash) && !providers.empty?
+        providers.each do |p_id, p_info|
+          p_name = p_info['name'] || p_id
+          npm_pkg = p_info['npm'] || 'default'
+          options = p_info['options'] || {}
+          base_url = options['baseURL'] || '(default / built-in)'
+          api_key_ref = options['apiKey'] || '(from environment)'
+
+          puts "  ┌─ Provider: #{bold(cyan(p_id))} (\"#{p_name}\")"
+          puts "  │  Base URL / Access Point: #{green(base_url)}"
+          puts "  │  NPM Engine:              #{npm_pkg}"
+          puts "  │  API Key Reference:       #{api_key_ref}"
+          if options['headers']
+            puts "  │  Headers:                 #{options['headers'].inspect}"
+          end
+
+          models = p_info['models']
+          if models.is_a?(Hash) && !models.empty?
+            puts "  │  Configured Models (#{models.size}):"
+            models.each do |m_id, m_info|
+              m_name = m_info.is_a?(Hash) ? (m_info['name'] || m_id) : m_id
+              full_model_id = "#{p_id}/#{m_id}"
+              is_selected = (full_model_id == data['model'] || m_id == data['model'])
+              marker = is_selected ? green(" [ACTIVE MODEL]") : ""
+              puts "  │    • #{cyan(full_model_id)}: \"#{m_name}\"#{marker}"
+              if m_info.is_a?(Hash) && m_info['options']
+                puts "  │      Options: #{m_info['options'].inspect}"
+              end
+            end
+          else
+            puts "  │  Configured Models:       (dynamic / provider default)"
+          end
+          puts "  └─────────────────────────────────────────"
+        end
+      else
+        puts "  #{yellow('No custom providers defined in config.json')}"
+      end
+
+      if data['agent'].is_a?(Hash)
+        puts ""
+        puts bold("Agents Configured:")
+        data['agent'].each do |agent_name, agent_cfg|
+          puts "  • #{bold(agent_name)}: model=#{cyan(agent_cfg['model'] || 'default')}, mode=#{agent_cfg['mode'] || 'primary'}"
+        end
+      end
+
+    rescue StandardError => e
+      puts red("Failed to parse config.json: #{e.message}")
+    end
+  else
+    puts red("Missing config.json file")
+  end
+  puts ""
+end
+
+# Set default model for a profile
+def set_profile_model(num_str, model_name)
+  ensure_initialized
+  num = format_num(num_str) || get_default_profile
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    warn "Available profiles: #{available_profile_nums.join(', ')}"
+    exit 1
+  end
+
+  cfg_file = File.join(profile_dir, 'config.json')
+  unless File.exist?(cfg_file)
+    warn red("Error: config.json not found in #{profile_dir}")
+    exit 1
+  end
+
+  data = JSON.parse(File.read(cfg_file)) rescue nil
+  unless data
+    warn red("Error: Invalid JSON in #{cfg_file}")
+    exit 1
+  end
+
+  final_model = model_name
+  if !final_model.include?('/') && data['provider'].is_a?(Hash)
+    matching_provider = nil
+    data['provider'].each do |p_id, p_info|
+      if p_info['models'].is_a?(Hash) && p_info['models'].key?(final_model)
+        matching_provider = p_id
+        break
+      end
+    end
+    matching_provider ||= data['provider'].keys.first if data['provider'].size == 1
+    final_model = "#{matching_provider}/#{final_model}" if matching_provider
+  end
+
+  data['model'] = final_model
+
+  if data['agent'].is_a?(Hash)
+    data['agent'].each do |_agent_name, agent_cfg|
+      if agent_cfg.is_a?(Hash) && agent_cfg['model']
+        agent_cfg['model'] = final_model
+      end
+    end
+  end
+
+  File.write(cfg_file, JSON.pretty_generate(data))
+
+  if num == get_default_profile
+    FileUtils.rm_f(TARGET_CFG)
+    FileUtils.cp(cfg_file, TARGET_CFG)
+  end
+
+  puts green("✓ Default model set to #{bold(cyan(final_model))} for Profile #{bold(num)}")
+end
+
+# Test profile connectivity and model response
+def test_profile(num_str = nil, custom_prompt = nil)
+  ensure_initialized
+  num = format_num(num_str) || get_default_profile
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    warn "Available profiles: #{available_profile_nums.join(', ')}"
+    exit 1
+  end
+
+  cfg_file = File.join(profile_dir, 'config.json')
+  api_file = File.join(profile_dir, 'API_key.sh')
+
+  unless File.exist?(cfg_file)
+    warn red("Error: config.json missing in #{profile_dir}")
+    exit 1
+  end
+
+  custom_env = {}
+  if File.exist?(api_file)
+    cmd = "set -a; source '#{api_file}' >/dev/null 2>&1; env -0"
+    env_out, st = Open3.capture2('bash', '-c', cmd)
+    if st.success?
+      env_out.split("\0").each do |pair|
+        k, v = pair.split('=', 2)
+        custom_env[k] = v if k && !k.empty?
+      end
+    end
+  end
+
+  data = JSON.parse(File.read(cfg_file)) rescue {}
+  model = data['model']
+  unless model
+    warn red("Error: No model configured in #{cfg_file}")
+    exit 1
+  end
+
+  base_url = nil
+  if data['provider'].is_a?(Hash)
+    first_p = data['provider'].values.first
+    base_url = first_p['options']['baseURL'] if first_p.is_a?(Hash) && first_p['options']
+  end
+
+  puts bold("Testing OpenCode Profile #{cyan(num)}...")
+  puts "  Model:    #{cyan(model)}"
+  puts "  Base URL: #{green(base_url || '(default)')}"
+  puts "  Sending test prompt to model endpoint..."
+
+  FileUtils.rm_f(TARGET_CFG)
+  FileUtils.rm_f(TARGET_JSONC)
+  FileUtils.cp(cfg_file, TARGET_CFG)
+
+  prompt = custom_prompt || "Respond with exact text: Hello from Profile #{num}"
+  test_cmd = ['opencode', 'run', prompt, '-m', model]
+
+  start_t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  merged_env = ENV.to_h.merge(custom_env)
+  stdout, stderr, status = Open3.capture3(merged_env, *test_cmd)
+  elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_t).round(2)
+
+  if status.success?
+    puts green("✓ SUCCESS: Profile #{num} is working properly! (#{elapsed}s)")
+    puts "  Response:\n"
+    stdout.strip.each_line do |l|
+      puts "    #{l}"
+    end
+    true
+  else
+    puts red("✗ FAILED: Profile #{num} returned exit status #{status.exitstatus} (#{elapsed}s)")
+    puts "  Error Output:\n"
+    (stderr.empty? ? stdout : stderr).strip.each_line do |l|
+      puts "    #{l}"
+    end
+    false
+  end
+end
+
+def test_all_profiles
+  ensure_initialized
+  profiles = available_profile_nums
+  puts bold("Running diagnostics on all #{profiles.size} profiles...\n")
+
+  results = {}
+  profiles.each do |p|
+    puts '--------------------------------------------------'
+    success = test_profile(p)
+    results[p] = success
+    puts ''
+  end
+
+  puts bold("================ Test Summary ================")
+  results.each do |p, success|
+    status_str = success ? green("PASSED") : red("FAILED")
+    puts "  Profile #{p}: #{status_str}"
+  end
+  puts bold("==============================================")
+end
+
+# Benchmark profile generation speed (tokens/sec and latency)
+def benchmark_profiles(profile_list = [], custom_prompt = nil, max_tokens = 400)
+  ensure_initialized
+  targets = profile_list.map { |p| format_num(p) }.compact
+  targets = [get_default_profile] if targets.empty?
+  targets = available_profile_nums if profile_list.include?('all')
+
+  prompt = custom_prompt || 'Write a clean Ruby implementation of Dijkstra shortest path algorithm with a Priority Queue and tests.'
+
+  puts bold("⚡ Running LLM Speed Benchmark on #{targets.size} profile(s)...")
+  puts "Prompt: \"#{prompt[0..60]}...\" (max #{max_tokens} tokens)\n\n"
+
+  results = []
+
+  targets.each do |num|
+    p_dir = File.join(SWITCH_DIR, num.to_s)
+    cfg_file = File.join(p_dir, 'config.json')
+    api_file = File.join(p_dir, 'API_key.sh')
+
+    unless File.exist?(cfg_file)
+      warn red("Profile #{num}: config.json not found.")
+      next
+    end
+
+    data = JSON.parse(File.read(cfg_file)) rescue {}
+    model = data['model']
+    provider_info = data['provider']&.values&.first || {}
+    provider_id = data['provider']&.keys&.first || 'provider'
+    provider_name = provider_info['name'] || provider_id
+    base_url = provider_info.dig('options', 'baseURL') || 'https://openrouter.ai/api/v1'
+
+    api_key = ''
+    if File.exist?(api_file)
+      content = File.read(api_file)
+      match = content.scan(/export\s+[A-Za-z0-9_]+=["']?([^"'\n]*)["']?/).flatten.first
+      api_key = match if match
+    end
+
+    raw_model = model.to_s.strip
+    raw_model = raw_model.sub(/^#{Regexp.escape(provider_id.to_s)}\//, '')
+
+    print "  • Benchmarking Profile #{bold(cyan(num))} (#{provider_name} - #{raw_model})... "
+    $stdout.flush
+
+    endpoint_url = "#{base_url.chomp('/')}/chat/completions"
+    uri = URI.parse(endpoint_url)
+
+    req = Net::HTTP::Post.new(uri)
+    req['Authorization'] = "Bearer #{api_key}"
+    req['Content-Type'] = 'application/json'
+    req['HTTP-Referer'] = 'https://opencode.ai'
+    req['X-Title'] = 'OpenCode Benchmark'
+    req.body = JSON.generate({
+      model: raw_model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: max_tokens,
+      stream: false
+    })
+
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    http.open_timeout = 15
+    http.read_timeout = 90
+
+    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    res = http.request(req) rescue nil
+    t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    total_time = (t1 - t0).round(2)
+
+    if res && res.is_a?(Net::HTTPSuccess)
+      res_json = JSON.parse(res.body) rescue {}
+      tokens_out = res_json.dig('usage', 'completion_tokens') || 0
+      tokens_in = res_json.dig('usage', 'prompt_tokens') || 0
+      speed = tokens_out > 0 && total_time > 0 ? (tokens_out / total_time).round(1) : 0
+
+      puts green("#{speed} tok/s") + " (#{tokens_out} tokens in #{total_time}s)"
+      results << {
+        num: num,
+        provider: provider_name,
+        model: raw_model,
+        time: total_time,
+        tokens_out: tokens_out,
+        speed: speed,
+        ok: true
+      }
+    else
+      err_msg = res ? "HTTP #{res.code}" : 'Connection error'
+      puts red("FAILED (#{err_msg})")
+      results << {
+        num: num,
+        provider: provider_name,
+        model: raw_model,
+        time: total_time,
+        ok: false,
+        error: err_msg
+      }
+    end
+  end
+
+  if results.size >= 2
+    successful = results.select { |r| r[:ok] }
+    if successful.size >= 2
+      sorted = successful.sort_by { |r| -r[:speed] }
+      winner = sorted.first
+      runner_up = sorted[1]
+      ratio = (winner[:speed] / [runner_up[:speed], 0.01].max).round(2)
+
+      puts "\n" + bold("=================== Benchmark Summary ===================")
+      sorted.each_with_index do |r, rank|
+        badge = rank == 0 ? green("🥇 #{r[:speed]} tok/s (Fastest)") : "   #{r[:speed]} tok/s"
+        puts "  Profile #{cyan(r[:num])} [#{r[:provider]}]: #{badge} - #{r[:tokens_out]} tokens in #{r[:time]}s"
+      end
+      puts '---------------------------------------------------------'
+      puts green("🏆 Profile #{winner[:num]} (#{winner[:provider]}) is #{ratio}x faster than Profile #{runner_up[:num]}!")
+      puts bold("=========================================================")
+    end
+  end
+end
+
+# Test and benchmark all models configured in a specific profile
+def test_models_in_profile(num_str = nil, custom_prompt = nil, max_tokens = 400)
+  ensure_initialized
+  num = format_num(num_str) || get_default_profile
+  profile_dir = File.join(SWITCH_DIR, num.to_s)
+
+  unless num && Dir.exist?(profile_dir)
+    warn red("Error: Profile '#{num_str}' does not exist.")
+    warn "Available profiles: #{available_profile_nums.join(', ')}"
+    exit 1
+  end
+
+  cfg_file = File.join(profile_dir, 'config.json')
+  api_file = File.join(profile_dir, 'API_key.sh')
+
+  unless File.exist?(cfg_file)
+    warn red("Error: config.json not found in #{profile_dir}")
+    exit 1
+  end
+
+  data = JSON.parse(File.read(cfg_file)) rescue {}
+  provider_info = data['provider']&.values&.first || {}
+  provider_id = data['provider']&.keys&.first || 'provider'
+  provider_name = provider_info['name'] || provider_id
+  base_url = provider_info.dig('options', 'baseURL') || 'https://openrouter.ai/api/v1'
+
+  api_key = ''
+  if File.exist?(api_file)
+    content = File.read(api_file)
+    match = content.scan(/export\s+[A-Za-z0-9_]+=["']?([^"'\n]*)["']?/).flatten.first
+    api_key = match if match
+  end
+
+  configured_models = provider_info['models']
+  model_list = []
+  if configured_models.is_a?(Hash) && !configured_models.empty?
+    configured_models.each do |m_id, m_cfg|
+      m_name = m_cfg.is_a?(Hash) ? (m_cfg['name'] || m_id) : m_id
+      model_list << { id: m_id, name: m_name }
+    end
+  else
+    default_m = data['model'].to_s.sub(/^#{Regexp.escape(provider_id)}\//, '')
+    model_list << { id: default_m, name: default_m }
+  end
+
+  prompt = custom_prompt || 'Write a clean Ruby implementation of Dijkstra shortest path algorithm with a Priority Queue and tests.'
+
+  puts bold("⚡ Speed Testing All #{model_list.size} Models in Profile #{cyan(num)} (#{provider_name})...")
+  puts "Access Point: #{green(base_url)}"
+  puts "Prompt:       \"#{prompt[0..60]}...\" (max #{max_tokens} tokens)\n\n"
+
+  results = []
+  endpoint_url = "#{base_url.chomp('/')}/chat/completions"
+  uri = URI.parse(endpoint_url)
+
+  model_list.each_with_index do |m, idx|
+    m_id = m[:id]
+    m_name = m[:name]
+    print "  [#{idx + 1}/#{model_list.size}] Testing #{bold(cyan(m_id.ljust(26)))} ... "
+    $stdout.flush
+
+    req = Net::HTTP::Post.new(uri)
+    req['Authorization'] = "Bearer #{api_key}"
+    req['Content-Type'] = 'application/json'
+    req['HTTP-Referer'] = 'https://opencode.ai'
+    req['X-Title'] = 'OpenCode Model Benchmark'
+    req.body = JSON.generate({
+      model: m_id,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: max_tokens,
+      stream: false
+    })
+
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    http.open_timeout = 15
+    http.read_timeout = 90
+
+    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    res = http.request(req) rescue nil
+    t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    total_time = (t1 - t0).round(2)
+
+    if res && res.is_a?(Net::HTTPSuccess)
+      res_json = JSON.parse(res.body) rescue {}
+      tokens_out = res_json.dig('usage', 'completion_tokens') || 0
+      speed = tokens_out > 0 && total_time > 0 ? (tokens_out / total_time).round(1) : 0
+      puts green("#{speed} tok/s") + " (#{tokens_out} tokens in #{total_time}s)"
+      results << {
+        id: m_id,
+        name: m_name,
+        time: total_time,
+        tokens_out: tokens_out,
+        speed: speed,
+        ok: true
+      }
+    else
+      err_msg = res ? "HTTP #{res.code}" : 'Connection error'
+      puts red("FAILED (#{err_msg})")
+      results << {
+        id: m_id,
+        name: m_name,
+        time: total_time,
+        ok: false,
+        error: err_msg
+      }
+    end
+  end
+
+  successful = results.select { |r| r[:ok] }
+  if successful.any?
+    sorted = successful.sort_by { |r| -r[:speed] }
+    puts "\n" + bold("=================== Profile #{num} Model Speed Leaderboard ===================")
+    sorted.each_with_index do |r, rank|
+      medal = case rank
+              when 0 then "🥇"
+              when 1 then "🥈"
+              when 2 then "🥉"
+              else "  "
+              end
+      puts "  #{medal} #{cyan(r[:id].ljust(28))} #{bold(green(r[:speed].to_s.rjust(6) + ' tok/s'))}  (#{r[:tokens_out]} tokens in #{r[:time]}s)"
+    end
+    puts bold("==========================================================================")
+    if sorted.size >= 2
+      fastest = sorted.first
+      slowest = sorted.last
+      ratio = (fastest[:speed] / [slowest[:speed], 0.01].max).round(2)
+      puts green("⚡ Fastest model in Profile #{num} is #{bold(fastest[:id])} at #{fastest[:speed]} tok/s (#{ratio}x faster than #{slowest[:id]})")
+    end
+  end
+end
+
+# Print main usage information
+def print_usage
+  puts bold("OpenCode Profile Manager & Execution Wrapper (oc)")
+  puts ""
+  puts bold("USAGE:")
+  puts "  oc [profile] [opencode_args...]    Run OpenCode with specified or default profile"
+  puts "  oc -- [opencode_args...]           Forward all arguments directly to OpenCode"
+  puts "  oc conf [subcommand]               Manage OpenCode configuration profiles"
+  puts ""
+  puts bold("RUNNING OPENCODE:")
+  puts "  oc                                 Run OpenCode using active default profile"
+  puts "  oc 02                              Run OpenCode using profile 02"
+  puts "  oc 01 \"fix issue #12\"              Run OpenCode profile 01 with a prompt"
+  puts "  oc 02 -m claude-3-7-sonnet         Run OpenCode profile 02 with model override"
+  puts "  oc -- -m custom/model -f main.rb   Pass raw flags directly to OpenCode"
+  puts ""
+  puts bold("PROFILE MANAGEMENT (oc conf / oc config / oc cfg / oc switch):")
+  puts "  oc conf                            List all profiles and status"
+  puts "  oc conf <number>                   Switch active default profile (e.g. oc conf 02)"
+  puts "  oc conf set_default <number>       Switch active default profile"
+  puts "  oc conf info [number|all]          Show profile details, models & access points"
+  puts "  oc conf test [number|all]          Test profile connectivity and model response"
+  puts "  oc conf bench [p1 p2...|all]       Benchmark generation speed (tokens/sec)"
+  puts "  oc conf test_models [number]       Speed test all models configured in a profile"
+  puts "  oc conf set_model [num] <model>    Set default model for a profile"
+  puts "  oc conf set_desc [num] <desc>      Set description for a profile"
+  puts "  oc conf set_api <num> <key>        Set API key for a profile"
+  puts "  oc conf create <config.json>       Create a new profile from a JSON config"
+  puts ""
+  puts bold("HELP:")
+  puts "  oc help | oc -h | oc -H | oc -? | oc /? | oc /H | oc --help"
+end
+
+# Configuration & Profile Subcommand Dispatcher
+def dispatch_config_command(args)
+  ensure_initialized
+
+  if args.empty? || args.first == 'list' || args.first == '-l' || args.first == '--list' || args.first == 'ls'
+    list_profiles
+    return
+  end
+
+  if help_arg?(args.first)
+    print_usage
+    return
+  end
+
+  cmd = args.shift
+
+  case cmd
+  when 'test_models', 'test-models', 'bench_models', 'bench-models', 'models_speed', 'speed_models'
+    num = args.shift
+    test_models_in_profile(num, args.join(' ').empty? ? nil : args.join(' '))
+
+  when 'benchmark', 'bench', 'speed'
+    benchmark_profiles(args)
+
+  when 'test', 'check', 'verify', 'diag'
+    target = args.shift
+    if target =~ /^(all|--all|-a)$/i
+      test_all_profiles
+    else
+      test_profile(target, args.join(' ').empty? ? nil : args.join(' '))
+    end
+
+  when 'info', 'show', 'inspect', 'view'
+    target_num = args.shift
+    if target_num =~ /^(all|--all|-a)$/i
+      available_profile_nums.each do |p|
+        show_profile_info(p)
+      end
+    else
+      show_profile_info(target_num)
+    end
+
+  when 'create', 'add', 'new'
+    json_file = args.shift
+    if json_file.nil?
+      warn red("Error: Missing JSON file path. Usage: oc conf create <path/to/config.json>")
+      exit 1
+    end
+    create_profile(json_file)
+
+  when 'set_default', 'set-default', 'default', 'use', 'switch', 'set'
+    num = args.shift
+    if num.nil?
+      warn red("Usage: oc conf set_default <profile_number>")
+      exit 1
+    end
+    set_default_profile(num)
+
+  when 'set_model', 'set-model', 'model'
+    first = args.shift
+    second = args.shift
+    if second
+      set_profile_model(first, second)
+    elsif first
+      set_profile_model(nil, first)
+    else
+      warn red("Usage: oc conf set_model [profile_number] <model_name>")
+      exit 1
+    end
+
+  when 'set_desc', 'set-desc', 'set_description', 'description', 'desc'
+    first = args.shift
+    second = args.join(' ').strip
+    if format_num(first) && !second.empty?
+      set_profile_description(first, second)
+    elsif first
+      set_profile_description(nil, ([first] + args).join(' ').strip)
+    else
+      warn red("Usage: oc conf set_desc [profile_number] <description_text>")
+      exit 1
+    end
+
+  when 'set_api', 'set-api', 'setkey'
+    num = args.shift
+    key = args.shift
+    if num.nil? || key.nil?
+      warn red("Usage: oc conf set_api <profile_number> <api_key_string>")
+      exit 1
+    end
+    set_api_key(num, key)
+
+  else
+    # Check if pattern is: oc conf <number> set_desc <desc>
+    if format_num(cmd) && args.first =~ /^(set_?desc|description|desc)$/i
+      args.shift
+      desc = args.join(' ').strip
+      if desc.empty?
+        warn red("Usage: oc conf #{cmd} set_desc <description_text>")
+        exit 1
+      end
+      set_profile_description(cmd, desc)
+    # Check if pattern is: oc conf <number> test_models
+    elsif format_num(cmd) && args.first =~ /^(test_?models|bench_?models|models_?speed)$/i
+      args.shift
+      test_models_in_profile(cmd, args.join(' ').empty? ? nil : args.join(' '))
+    # Check if pattern is: oc conf <number> bench
+    elsif format_num(cmd) && args.first =~ /^(benchmark|bench|speed)$/i
+      args.shift
+      benchmark_profiles([cmd] + args)
+    # Check if pattern is: oc conf <number> test / check
+    elsif format_num(cmd) && args.first =~ /^(test|check|verify|diag)$/i
+      args.shift
+      test_profile(cmd, args.join(' ').empty? ? nil : args.join(' '))
+    # Check if pattern is: oc conf <number> info / show
+    elsif format_num(cmd) && args.first =~ /^(info|show|inspect)$/i
+      show_profile_info(cmd)
+    # Check if pattern is: oc conf <number> set_model <model>
+    elsif format_num(cmd) && args.first =~ /^(set_?model|model)$/i
+      args.shift
+      model = args.shift
+      if model.nil?
+        warn red("Usage: oc conf #{cmd} set_model <model_name>")
+        exit 1
+      end
+      set_profile_model(cmd, model)
+    # Check if pattern is: oc conf <number> set_api <key>
+    elsif format_num(cmd) && args.first =~ /^set_?api$/i
+      args.shift
+      key = args.shift
+      if key.nil?
+        warn red("Usage: oc conf #{cmd} set_api <api_key_string>")
+        exit 1
+      end
+      set_api_key(cmd, key)
+    elsif format_num(cmd)
+      set_default_profile(cmd)
+    else
+      warn red("Error: Unknown configuration command or profile '#{cmd}'")
+      warn "Run 'oc help' or 'oc conf --help' for usage."
+      exit 1
+    end
+  end
+end
+
+# OpenCode subcommands that do not take -m
+STANDALONE_COMMANDS = %w[
+  completion acp mcp attach debug providers auth agent
+  upgrade uninstall serve web models stats export import
+  github pr session plugin plug db
+].freeze
+
+# ----------------------------------------------------
+# Main Execution Dispatcher
+# ----------------------------------------------------
+ensure_initialized
+
+args = ARGV.dup
+program_basename = File.basename($PROGRAM_NAME)
+
+# If invoked as opencode-switch, direct straight to config dispatcher
+if program_basename =~ /^opencode-switch/i
+  dispatch_config_command(args)
+  exit 0
+end
+
+# Check for top-level help triggers: oc help, oc -h, oc -H, oc -?, oc /?, oc /H, oc --help, etc.
+if help_arg?(args.first)
+  print_usage
+  exit 0
+end
+
+# Check for profile management namespace: oc conf, oc config, oc cfg, oc switch
+if args.first =~ /^(conf|config|cfg|switch)$/i
+  args.shift
+  dispatch_config_command(args)
+  exit 0
+end
+
+# Check for explicit passthrough delimiter: oc -- <args...>
+if args.first == '--'
+  args.shift
+  target_profile_num = get_default_profile
+else
+  # Check if first argument is a profile number (e.g. oc 02 or oc 2)
+  target_profile_num = nil
+  if args.any?
+    candidate = format_num(args.first)
+    if candidate && Dir.exist?(File.join(SWITCH_DIR, candidate))
+      target_profile_num = candidate
+      args.shift
+    end
+  end
+  target_profile_num ||= get_default_profile
+
+  # Strip optional '--' after profile number (e.g. oc 02 -- -m custom)
+  args.shift if args.first == '--'
+end
+
+if target_profile_num.nil?
+  warn red("Error: No OpenCode profiles configured in #{SWITCH_DIR}")
+  warn "Run 'oc conf create <config.json>' to add a profile."
+  exit 1
+end
+
+profile_dir = File.join(SWITCH_DIR, target_profile_num)
+unless Dir.exist?(profile_dir)
+  warn red("Error: Profile '#{target_profile_num}' directory not found at #{profile_dir}")
+  exit 1
+end
+
+# 1. Source API_key.sh and inject variables into ENV
+api_script = File.join(profile_dir, 'API_key.sh')
+if File.exist?(api_script)
+  cmd = "set -a; source '#{api_script}' >/dev/null 2>&1; env -0"
+  env_out, status = Open3.capture2('bash', '-c', cmd)
+  if status.success?
+    env_out.split("\0").each do |pair|
+      k, v = pair.split('=', 2)
+      ENV[k] = v if k && !k.empty?
+    end
+  else
+    warn yellow("Warning: Failed to execute #{api_script}")
+  end
+end
+
+# 2. Copy config.json over to active ~/.config/opencode/opencode.json and clean shadowing files
+FileUtils.rm_f(TARGET_JSONC)
+
+cfg_src = File.join(profile_dir, 'config.json')
+profile_model = nil
+
+if File.exist?(cfg_src)
+  FileUtils.rm_f(TARGET_CFG)
+  FileUtils.cp(cfg_src, TARGET_CFG)
+  begin
+    data = JSON.parse(File.read(cfg_src))
+    profile_model = data['model']
+  rescue StandardError
+  end
+else
+  warn yellow("Warning: Missing #{cfg_src}")
+end
+
+# 3. Handle model forwarding if not explicitly supplied
+has_model_flag = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }
+is_subcommand = args.first && STANDALONE_COMMANDS.include?(args.first.downcase)
+
+if profile_model && !has_model_flag && !is_subcommand
+  args.unshift('-m', profile_model)
+end
+
+# 4. Locate and execute opencode binary
+opencode_bin = ENV['OPENCODE_BIN'] ||
+               `which opencode 2>/dev/null`.strip
+
+opencode_bin = File.expand_path('~/.opencode/bin/opencode') if opencode_bin.empty? || !File.exist?(opencode_bin)
+
+unless File.exist?(opencode_bin)
+  warn red("Error: Could not locate 'opencode' binary.")
+  exit 1
+end
+
+$stderr.puts cyan("[oc] Active Profile: #{bold(target_profile_num)} | Model: #{bold(profile_model || '(default)')}")
+exec(opencode_bin, *args)
