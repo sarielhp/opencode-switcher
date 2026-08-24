@@ -24,6 +24,21 @@ OpenCode stores its active configuration in `~/.config/opencode/opencode.json`. 
 
 ## Installation
 
+### Quick Installation
+
+Run `./oc install` from this repository to automatically copy `oc` to `~/.local/bin` (or another directory in your `PATH`), make it executable, and create the `opencode-switcher` symlink:
+
+```bash
+./oc install
+```
+
+You can also specify a custom target directory:
+```bash
+./oc install ~/.local/bin
+# or
+./oc install ~/bin
+```
+
 ### Manual Installation
 
 Copy `oc` to a directory in your `PATH` (such as `~/.local/bin`) and make it executable:
@@ -215,6 +230,30 @@ oc /h
 oc /H
 oc --help
 ```
+
+---
+
+### 5. Remote Sync (`oc ssh`)
+
+Copy `oc` to a remote machine's `~/bin/` directory, sync the switcher configuration, and optionally sync `~/.config/opencode/AGENTS.md`:
+
+```bash
+# Copy oc to remote ~/bin/ and sync switcher config
+oc ssh user@remote-host
+
+# Also sync ~/.config/opencode/AGENTS.md (with automatic versioned remote backup)
+oc ssh user@remote-host -all
+```
+
+What `oc ssh <remote>` does:
+1. Ensures `~/bin/` and `~/.config/opencode-switcher/` exist on the remote.
+2. Copies `oc` to `<remote>:~/bin/oc`, makes it executable, and creates the `opencode-switcher -> oc` symlink.
+3. Rsyncs `~/.config/opencode-switcher/` to the remote.
+4. By default, `AGENTS.md` is **not** copied. Pass `-all` to also sync it.
+
+When `-all` is used, any existing remote `~/.config/opencode/AGENTS.md` is first backed up to `AGENTS.md.bak.NNN` (e.g. `.bak.001`, `.bak.002`, ...) using the lowest unused counter, so old configurations are never overwritten.
+
+The same command is available under the config namespace: `oc conf ssh <remote> [-all]`.
 
 ---
 

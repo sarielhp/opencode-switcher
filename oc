@@ -7,7 +7,7 @@ require 'open3'
 require 'net/http'
 require 'uri'
 
-VERSION      = '0.1'
+VERSION      = '0.1.1'
 SWITCH_DIR   = File.expand_path('~/.config/opencode-switcher')
 LEGACY_DIRS  = [
   File.expand_path('~/.config/opencode_switch'),
@@ -999,6 +999,237 @@ def test_models_in_profile(num_str = nil, custom_prompt = nil, max_tokens = 400)
   end
 end
 
+# Install oc and opencode-switcher to a binary directory in PATH
+def install_script(target_dir_arg = nil, extra_args = [])
+  all_args = [target_dir_arg, *extra_args].compact
+
+  if all_args.any? { |a| help_arg?(a) }
+    puts bold("Install oc and opencode-switcher")
+    puts ""
+    puts bold("USAGE:")
+    puts "  oc install [directory] [options]"
+    puts "  oc conf install [directory] [options]"
+    puts ""
+    puts bold("OPTIONS:")
+    puts "  [directory]        Target directory (default: ~/.local/bin or ~/bin)"
+    puts "  --dir <path>       Target directory"
+    puts "  --prefix <path>    Target prefix (installs into <prefix>/bin)"
+    puts "  -h, --help         Show this help message"
+    return
+  end
+
+  # Parse directory from arguments
+  chosen_dir = nil
+  i = 0
+  while i < all_args.size
+    arg = all_args[i]
+    if arg =~ /^--dir=(.+)$/
+      chosen_dir = $1
+    elsif arg == '--dir'
+      i += 1
+      chosen_dir = all_args[i]
+    elsif arg =~ /^--prefix=(.+)$/
+      chosen_dir = File.join($1, 'bin')
+    elsif arg == '--prefix'
+      i += 1
+      chosen_dir = File.join(all_args[i], 'bin') if all_args[i]
+    elsif !arg.start_with?('-') && chosen_dir.nil?
+      chosen_dir = arg
+    end
+    i += 1
+  end
+
+  # If not specified, choose best target directory from PATH or standard defaults
+  if chosen_dir.nil? || chosen_dir.strip.empty?
+    path_dirs = (ENV['PATH'] || '').split(File::PATH_SEPARATOR).map { |d| File.expand_path(d) rescue d }
+    local_bin = File.expand_path('~/.local/bin')
+    home_bin = File.expand_path('~/bin')
+
+    if path_dirs.include?(local_bin)
+      chosen_dir = local_bin
+    elsif path_dirs.include?(home_bin)
+      chosen_dir = home_bin
+    elsif Dir.exist?(local_bin)
+      chosen_dir = local_bin
+    elsif Dir.exist?(home_bin)
+      chosen_dir = home_bin
+    else
+      chosen_dir = local_bin
+    end
+  else
+    chosen_dir = File.expand_path(chosen_dir)
+  end
+
+  source_file = (File.realpath(__FILE__) rescue nil) || File.expand_path(__FILE__)
+  unless File.exist?(source_file)
+    warn red("Error: Source script file not found at #{source_file}")
+    exit 1
+  end
+
+  FileUtils.mkdir_p(chosen_dir)
+
+  target_oc = File.join(chosen_dir, 'oc')
+  target_switcher = File.join(chosen_dir, 'opencode-switcher')
+
+  # Copy oc binary
+  same_file = false
+  if File.exist?(target_oc)
+    begin
+      same_file = File.identical?(source_file, target_oc) ||
+                  (File.realpath(target_oc) == File.realpath(source_file))
+    rescue StandardError
+      same_file = (File.expand_path(target_oc) == File.expand_path(source_file))
+    end
+  end
+
+  if same_file
+    FileUtils.chmod(0755, target_oc)
+    puts green("✓ #{bold(target_oc)} is up to date (permissions set to 0755)")
+  else
+    FileUtils.cp(source_file, target_oc)
+    FileUtils.chmod(0755, target_oc)
+    puts green("✓ Installed #{bold('oc')} to #{bold(target_oc)}")
+  end
+
+  # Create opencode-switcher symlink pointing to oc
+  begin
+    FileUtils.rm_f(target_switcher)
+    Dir.chdir(chosen_dir) do
+      FileUtils.ln_s('oc', 'opencode-switcher')
+    end
+    puts green("✓ Created symlink #{bold(target_switcher)} -> oc")
+  rescue StandardError => e
+    # Fallback to copy if symlinks are not supported
+    FileUtils.cp(target_oc, target_switcher)
+    FileUtils.chmod(0755, target_switcher)
+    puts green("✓ Copied #{bold('opencode-switcher')} to #{bold(target_switcher)}")
+  end
+
+  # Check PATH
+  path_dirs = (ENV['PATH'] || '').split(File::PATH_SEPARATOR).map { |d| File.expand_path(d) rescue d }
+  if path_dirs.include?(File.expand_path(chosen_dir))
+    puts green("✓ #{chosen_dir} is in your PATH")
+    puts "\n#{bold('Success!')} You can now run #{cyan('oc')} or #{cyan('opencode-switcher')} from anywhere."
+  else
+    puts ""
+    puts yellow("Notice:") + " #{bold(chosen_dir)} is not currently in your PATH."
+    puts "To use 'oc' from anywhere, add the following line to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+    puts "\n  #{cyan("export PATH=\"#{chosen_dir}:$PATH\"")}\n"
+  end
+end
+
+# Sync oc and configuration to a remote machine over SSH
+def sync_remote(remote_host, extra_args = [])
+  all_args = [remote_host, *extra_args].compact
+
+  if all_args.any? { |a| help_arg?(a) }
+    puts bold("Sync oc and opencode-switcher to a remote machine")
+    puts ""
+    puts bold("USAGE:")
+    puts "  oc ssh <remote> [-all]"
+    puts "  oc conf ssh <remote> [-all]"
+    puts ""
+    puts bold("OPTIONS:")
+    puts "  <remote>         SSH host (e.g. user@host)"
+    puts "  -all, --all      Also sync ~/.config/opencode/AGENTS.md (with versioned remote backup)"
+    puts "  -h, --help       Show this help message"
+    return
+  end
+
+  # Parse -all / --all flag (may appear before or after <remote>)
+  copy_all = all_args.any? { |a| a =~ /^-+all$/i }
+  host = all_args.find { |a| a !~ /^-/ }
+
+  if host.nil? || host.strip.empty?
+    warn red("Error: Missing remote host. Usage: oc ssh <remote> [-all]")
+    exit 1
+  end
+
+  puts bold("Syncing oc and opencode-switcher to #{cyan(host)}...")
+  puts ""
+
+  # Step A: Ensure remote directories exist
+  puts cyan("  [1/4] Preparing remote directories...")
+  prep_cmd = "mkdir -p ~/bin ~/.config/opencode-switcher"
+  _out, _err, st = Open3.capture3('ssh', host, prep_cmd)
+  unless st.success?
+    warn red("Error: Failed to prepare remote directories on #{host}")
+    warn _err.strip
+    exit 1
+  end
+  puts green("  ✓ Remote directories ready")
+
+  # Step B: Copy oc to remote ~/bin/ and set up symlink
+  puts cyan("  [2/4] Copying oc to #{host}:~/bin/...")
+  source_file = (File.realpath(__FILE__) rescue nil) || File.expand_path(__FILE__)
+  unless File.exist?(source_file)
+    warn red("Error: Source script file not found at #{source_file}")
+    exit 1
+  end
+
+  _, _, st = Open3.capture3('scp', source_file, "#{host}:~/bin/oc")
+  unless st.success?
+    warn red("Error: Failed to copy oc to #{host}:~/bin/oc")
+    exit 1
+  end
+
+  setup_cmd = "chmod +x ~/bin/oc; ln -sf oc ~/bin/opencode-switcher"
+  _, _, st = Open3.capture3('ssh', host, setup_cmd)
+  unless st.success?
+    warn red("Error: Failed to set permissions/symlink on #{host}")
+    exit 1
+  end
+  puts green("  Installed oc to #{host}:~/bin/oc (symlink opencode-switcher -> oc)")
+
+  # Step C: Sync switcher config directory
+  puts cyan("  [3/4] Syncing ~/.config/opencode-switcher/ ...")
+  _, _, st = Open3.capture3('rsync', '-avz', '-e', 'ssh',
+                            "#{SWITCH_DIR}/", "#{host}:~/.config/opencode-switcher/")
+  unless st.success?
+    warn red("Error: Failed to rsync switcher config to #{host}")
+    exit 1
+  end
+  puts green("  Switcher config synced")
+
+  # Step D: AGENTS.md handling
+  agents_local = File.join(OPENCODE_DIR, 'AGENTS.md')
+  if copy_all
+    puts cyan("  [4/4] Syncing ~/.config/opencode/AGENTS.md ...")
+    unless File.exist?(agents_local)
+      warn yellow("  Warning: Local #{agents_local} not found; skipping AGENTS.md sync")
+    else
+      # Back up any existing remote AGENTS.md to a versioned .bak.NNN
+      backup_cmd = <<~SH
+        cd ~/.config/opencode 2>/dev/null || exit 0
+        if [ -f AGENTS.md ]; then
+          n=1
+          while [ -f "AGENTS.md.bak.$(printf '%03d' $n)" ]; do n=$((n+1)); done
+          cp AGENTS.md "AGENTS.md.bak.$(printf '%03d' $n)"
+        fi
+      SH
+      _, _, st = Open3.capture3('ssh', host, backup_cmd)
+      unless st.success?
+        warn red("  Error: Failed to back up remote AGENTS.md on #{host}")
+        exit 1
+      end
+
+      _, _, st = Open3.capture3('rsync', '-az', '-e', 'ssh',
+                                agents_local, "#{host}:~/.config/opencode/AGENTS.md")
+      unless st.success?
+        warn red("  Error: Failed to rsync AGENTS.md to #{host}")
+        exit 1
+      end
+      puts green("  AGENTS.md synced (remote backup created if needed)")
+    end
+  else
+    puts cyan("  [4/4] Skipping ~/.config/opencode/AGENTS.md (not requested)")
+    puts yellow("  Tip: Pass -all (e.g. oc ssh #{host} -all) to also sync ~/.config/opencode/AGENTS.md with automatic versioned remote backup.")
+  end
+
+  puts ""
+  puts green("✓ Remote sync to #{bold(host)} complete.")
+end
+
 # Print main usage information
 def print_usage
   puts bold("OpenCode Profile Manager & Execution Wrapper (oc / opencode-switcher) v#{VERSION}")
@@ -1007,6 +1238,8 @@ def print_usage
   puts "  oc [profile] [opencode_args...]    Run OpenCode with specified or default profile"
   puts "  oc -- [opencode_args...]           Forward all arguments directly to OpenCode"
   puts "  oc conf [subcommand]               Manage OpenCode configuration profiles"
+  puts "  oc install [dir]                   Install oc and opencode-switcher to PATH"
+  puts "  oc ssh <remote> [-all]             Sync oc and config to a remote machine"
   puts ""
   puts bold("RUNNING OPENCODE:")
   puts "  oc                                 Run OpenCode using active default profile"
@@ -1027,7 +1260,17 @@ def print_usage
   puts "  oc conf set_desc [num] <desc>      Set description for a profile"
   puts "  oc conf set_api <num> <key>        Set API key for a profile"
   puts "  oc conf create <config.json>       Create a new profile from a JSON config"
+  puts "  oc conf install [dir]              Install oc and opencode-switcher to PATH"
+  puts "  oc conf ssh <remote> [-all]        Sync oc and config to a remote machine"
   puts "  oc conf version                    Show opencode-switcher version"
+  puts ""
+  puts bold("INSTALLATION:")
+  puts "  oc install                         Install oc and opencode-switcher to ~/.local/bin"
+  puts "  oc install <dir>                   Install into custom directory (e.g. ~/bin)"
+  puts ""
+  puts bold("REMOTE SYNC:")
+  puts "  oc ssh <remote>                    Copy oc to remote ~/bin/ and sync switcher config"
+  puts "  oc ssh <remote> -all               Also sync ~/.config/opencode/AGENTS.md (with backup)"
   puts ""
   puts bold("HELP & VERSION:")
   puts "  oc help | oc -h | oc -H | oc -? | oc /? | oc /H | oc --help"
@@ -1130,6 +1373,14 @@ def dispatch_config_command(args)
     end
     set_api_key(num, key)
 
+  when 'install'
+    target = args.shift
+    install_script(target, args)
+
+  when 'ssh', 'sync', 'remote'
+    host = args.shift
+    sync_remote(host, args)
+
   when 'version', '-v', '-V', '--version'
     puts "opencode-switcher v#{VERSION}"
 
@@ -1226,6 +1477,22 @@ if args.first =~ /^(conf|config|cfg|switch)$/i
   exit 0
 end
 
+# Check for install command: oc install [dir]
+if args.first =~ /^install$/i
+  args.shift
+  target = args.shift
+  install_script(target, args)
+  exit 0
+end
+
+# Check for remote sync command: oc ssh <remote> [-all]
+if args.first =~ /^(ssh|sync|remote)$/i
+  args.shift
+  host = args.shift
+  sync_remote(host, args)
+  exit 0
+end
+
 # Check for explicit passthrough delimiter: oc -- <args...>
 if args.first == '--'
   args.shift
@@ -1278,13 +1545,14 @@ FileUtils.rm_f(TARGET_JSONC)
 
 cfg_src = File.join(profile_dir, 'config.json')
 profile_model = nil
+profile_data = nil
 
 if File.exist?(cfg_src)
   FileUtils.rm_f(TARGET_CFG)
   FileUtils.cp(cfg_src, TARGET_CFG)
   begin
-    data = JSON.parse(File.read(cfg_src))
-    profile_model = data['model']
+    profile_data = JSON.parse(File.read(cfg_src))
+    profile_model = profile_data['model']
   rescue StandardError
   end
 else
@@ -1294,6 +1562,14 @@ end
 # 3. Handle model forwarding if not explicitly supplied
 has_model_flag = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }
 is_subcommand = args.first && STANDALONE_COMMANDS.include?(args.first.downcase)
+
+# Check if config has agent-specific models - if so, use build agent model for run
+if profile_data && profile_data['agent'].is_a?(Hash)
+  has_agent_models = profile_data['agent'].values.any? { |a| a.is_a?(Hash) && a['model'] }
+  if has_agent_models && profile_data['agent']['build'].is_a?(Hash) && profile_data['agent']['build']['model']
+    profile_model = profile_data['agent']['build']['model']
+  end
+end
 
 if profile_model && !has_model_flag && !is_subcommand
   args.unshift('-m', profile_model)
