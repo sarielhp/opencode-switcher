@@ -7,7 +7,7 @@ require 'open3'
 require 'net/http'
 require 'uri'
 
-VERSION      = '0.1.1'
+VERSION      = '0.1.2'
 SWITCH_DIR   = File.expand_path('~/.config/opencode-switcher')
 LEGACY_DIRS  = [
   File.expand_path('~/.config/opencode_switch'),
@@ -86,8 +86,83 @@ def get_default_profile
   available_profile_nums.first
 end
 
-# Set default profile number in default.json and copy config.json to ~/.config/opencode/opencode.json
-def set_default_profile(num_str)
+# Parse JSON with Comments (JSONC), supporting single-line (//), block (/* */),
+# and trailing commas before } or ]. Preserves strings containing // or /*.
+def parse_jsonc(content)
+  return {} if content.nil? || content.strip.empty?
+  # Remove block and line comments while preserving double-quoted strings
+  cleaned = content.gsub(/("(?:[^"\\]|\\.)*")|(\/\*[\s\S]*?\*\/|\/\/[^\n]*)/) do
+    $1 ? $1 : ''
+  end
+  # Remove trailing commas before closing braces/brackets
+  cleaned = cleaned.gsub(/,\s*([\]}])/, '\1')
+  JSON.parse(cleaned)
+end
+
+# Recursively deep merge two hashes.
+# Arrays are concatenated and deduplicated ((base + override).uniq).
+# Hashes are merged recursively.
+# Primitives in override overwrite base.
+def deep_merge(base, override)
+  return (override || {}).dup if base.nil?
+  return (base || {}).dup if override.nil?
+
+  base.merge(override) do |_key, old_val, new_val|
+    if old_val.is_a?(Hash) && new_val.is_a?(Hash)
+      deep_merge(old_val, new_val)
+    elsif old_val.is_a?(Array) && new_val.is_a?(Array)
+      (old_val + new_val).uniq
+    else
+      new_val
+    end
+  end
+end
+
+# Find base configuration file (base.jsonc or base.json) in SWITCH_DIR
+def find_base_config_file
+  [
+    File.join(SWITCH_DIR, 'base.jsonc'),
+    File.join(SWITCH_DIR, 'base.json')
+  ].find { |f| File.exist?(f) }
+end
+
+# Find config file for a profile (config.jsonc or config.json)
+def find_profile_config_file(profile_dir)
+  return nil unless profile_dir && Dir.exist?(profile_dir)
+  [
+    File.join(profile_dir, 'config.jsonc'),
+    File.join(profile_dir, 'config.json')
+  ].find { |f| File.exist?(f) }
+end
+
+# Load raw profile delta config (as Hash)
+def load_profile_raw_config(profile_dir)
+  cfg_file = find_profile_config_file(profile_dir)
+  return {} unless cfg_file && File.exist?(cfg_file)
+  parse_jsonc(File.read(cfg_file)) rescue {}
+end
+
+# Load base config (as Hash)
+def load_base_config
+  base_file = find_base_config_file
+  return {} unless base_file && File.exist?(base_file)
+  parse_jsonc(File.read(base_file)) rescue {}
+end
+
+# Compile effective configuration by deep-merging base.jsonc and profile delta
+def compile_profile_config(num_str)
+  num = format_num(num_str)
+  return {} unless num
+  profile_dir = File.join(SWITCH_DIR, num)
+  return {} unless Dir.exist?(profile_dir)
+
+  base_cfg = load_base_config
+  prof_cfg = load_profile_raw_config(profile_dir)
+  deep_merge(base_cfg, prof_cfg)
+end
+
+# Compile and activate profile in ~/.config/opencode/opencode.json
+def compile_and_switch_profile(num_str)
   num = format_num(num_str)
   profile_dir = File.join(SWITCH_DIR, num.to_s)
   unless num && Dir.exist?(profile_dir)
@@ -96,17 +171,27 @@ def set_default_profile(num_str)
     exit 1
   end
 
-  File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
-
-  # Copy config to active OpenCode location
-  cfg_src = File.join(profile_dir, 'config.json')
-  if File.exist?(cfg_src)
-    FileUtils.rm_f(TARGET_CFG)
-    FileUtils.rm_f(TARGET_JSONC)
-    FileUtils.cp(cfg_src, TARGET_CFG)
+  final_cfg = compile_profile_config(num)
+  if final_cfg.empty?
+    warn red("Error: Profile '#{num}' configuration is empty or could not be parsed.")
+    exit 1
   end
 
+  # Remove shadowing files and atomically write compiled opencode.json
+  FileUtils.rm_f(TARGET_JSONC)
+  FileUtils.rm_f(TARGET_CFG)
+  File.write(TARGET_CFG, JSON.pretty_generate(final_cfg))
+
+  File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
+  final_cfg
+end
+
+# Set default profile number in default.json and compile active config
+def set_default_profile(num_str)
+  num = format_num(num_str)
+  final_cfg = compile_and_switch_profile(num_str)
   puts green("✓ Default profile set to #{bold(num)}")
+  final_cfg
 end
 
 # Inspect JSON config structure to find API environment variable names
@@ -261,14 +346,16 @@ def list_profiles
   ensure_initialized
   profiles = available_profile_nums
   default_num = get_default_profile
+  base_file = find_base_config_file
 
-  puts bold("OpenCode Profiles (~/.config/opencode-switcher/):")
+  base_note = base_file ? cyan(" (base: #{File.basename(base_file)})") : ""
+  puts bold("OpenCode Profiles (~/.config/opencode-switcher/):#{base_note}")
   profiles.each_with_index do |p_num, idx|
     is_default = (p_num == default_num)
     indicator = is_default ? green("  * #{p_num} [default]") : "    #{p_num}          "
 
     p_dir = File.join(SWITCH_DIR, p_num)
-    cfg_file = File.join(p_dir, 'config.json')
+    cfg_file = find_profile_config_file(p_dir)
     api_file = File.join(p_dir, 'API_key.sh')
 
     model = '(no default model)'
@@ -276,20 +363,23 @@ def list_profiles
     description = nil
     base_url = nil
 
-    if File.exist?(cfg_file)
+    if cfg_file && File.exist?(cfg_file)
       begin
-        data = JSON.parse(File.read(cfg_file))
-        model = data['model'] || '(no default model)'
-        description = data['description']
-        if data['provider'].is_a?(Hash) && !data['provider'].empty?
-          provider = data['provider'].keys.join(', ')
-          first_p = data['provider'].values.first
+        raw_data = load_profile_raw_config(p_dir)
+        compiled_data = compile_profile_config(p_num)
+        description = raw_data['description'] || compiled_data['description']
+        model = raw_data['model'] || compiled_data['model'] || '(no default model)'
+
+        providers = raw_data['provider'] || compiled_data['provider']
+        if providers.is_a?(Hash) && !providers.empty?
+          provider = providers.keys.join(', ')
+          first_p = providers.values.first
           if first_p.is_a?(Hash) && first_p['options'].is_a?(Hash)
             base_url = first_p['options']['baseURL']
           end
         end
       rescue StandardError
-        model = '(invalid json)'
+        model = '(invalid json/jsonc)'
       end
     end
 
@@ -333,15 +423,15 @@ def set_profile_description(num_str, desc_text)
     exit 1
   end
 
-  cfg_file = File.join(profile_dir, 'config.json')
-  unless File.exist?(cfg_file)
-    warn red("Error: config.json not found in #{profile_dir}")
+  cfg_file = find_profile_config_file(profile_dir)
+  unless cfg_file && File.exist?(cfg_file)
+    warn red("Error: config file not found in #{profile_dir}")
     exit 1
   end
 
-  data = JSON.parse(File.read(cfg_file)) rescue nil
+  data = parse_jsonc(File.read(cfg_file)) rescue nil
   unless data
-    warn red("Error: Invalid JSON in #{cfg_file}")
+    warn red("Error: Invalid JSON/JSONC in #{cfg_file}")
     exit 1
   end
 
@@ -349,14 +439,13 @@ def set_profile_description(num_str, desc_text)
   File.write(cfg_file, JSON.pretty_generate(data))
 
   if num == get_default_profile
-    FileUtils.rm_f(TARGET_CFG)
-    FileUtils.cp(cfg_file, TARGET_CFG)
+    compile_and_switch_profile(num)
   end
 
   puts green("✓ Updated description for Profile #{bold(num)} to: #{bold(cyan(desc_text))}")
 end
 
-# Create a new profile from a JSON file
+# Create a new profile from a JSON or JSONC file
 def create_profile(json_path)
   ensure_initialized
   unless File.exist?(json_path)
@@ -365,9 +454,9 @@ def create_profile(json_path)
   end
 
   raw_content = File.read(json_path)
-  json_data = JSON.parse(raw_content) rescue nil
+  json_data = parse_jsonc(raw_content) rescue nil
   unless json_data
-    warn red("Error: File '#{json_path}' is not valid JSON.")
+    warn red("Error: File '#{json_path}' is not valid JSON or JSONC.")
     exit 1
   end
 
@@ -396,7 +485,8 @@ def create_profile(json_path)
 
   inject_env_placeholders!(json_data, env_var_map)
 
-  dest_cfg = File.join(profile_dir, 'config.json')
+  dest_ext = json_path.end_with?('.jsonc') ? 'config.jsonc' : 'config.json'
+  dest_cfg = File.join(profile_dir, dest_ext)
   File.write(dest_cfg, JSON.pretty_generate(json_data))
 
   primary_var = env_vars.first || 'API_KEY'
@@ -434,7 +524,7 @@ def set_api_key(num_str, api_key_value)
   end
 
   api_file = File.join(profile_dir, 'API_key.sh')
-  cfg_file = File.join(profile_dir, 'config.json')
+  cfg_file = find_profile_config_file(profile_dir)
 
   var_name = nil
   if File.exist?(api_file)
@@ -444,8 +534,8 @@ def set_api_key(num_str, api_key_value)
     end
   end
 
-  if var_name.nil? && File.exist?(cfg_file)
-    json_data = JSON.parse(File.read(cfg_file)) rescue {}
+  if var_name.nil? && cfg_file && File.exist?(cfg_file)
+    json_data = parse_jsonc(File.read(cfg_file)) rescue {}
     var_name = detect_api_env_vars(json_data).first
   end
 
@@ -460,8 +550,8 @@ def set_api_key(num_str, api_key_value)
   File.write(api_file, script_content)
   FileUtils.chmod(0755, api_file)
 
-  if File.exist?(cfg_file)
-    json_data = JSON.parse(File.read(cfg_file)) rescue nil
+  if cfg_file && File.exist?(cfg_file)
+    json_data = parse_jsonc(File.read(cfg_file)) rescue nil
     if json_data
       inject_env_placeholders!(json_data, { nil => var_name })
       File.write(cfg_file, JSON.pretty_generate(json_data))
@@ -491,7 +581,8 @@ def show_profile_info(num_str = nil)
     exit 1
   end
 
-  cfg_file = File.join(profile_dir, 'config.json')
+  cfg_file = find_profile_config_file(profile_dir) || File.join(profile_dir, 'config.jsonc')
+  base_file = find_base_config_file
   api_file = File.join(profile_dir, 'API_key.sh')
   default_num = get_default_profile
   is_default = (num == default_num)
@@ -500,7 +591,8 @@ def show_profile_info(num_str = nil)
   puts bold("  OpenCode Profile Details: #{cyan(num)} #{is_default ? green('[ACTIVE DEFAULT]') : ''}")
   puts bold("==================================================")
   puts "Directory:       #{profile_dir}"
-  puts "Config file:     #{cfg_file}"
+  puts "Base config:     #{base_file ? green(base_file) : yellow('(none - standalone mode)')}"
+  puts "Profile config:  #{File.exist?(cfg_file) ? green(cfg_file) : red(cfg_file)}"
   puts "API Key script:  #{api_file}"
   puts ""
 
@@ -522,15 +614,17 @@ def show_profile_info(num_str = nil)
   end
   puts ""
 
-  if File.exist?(cfg_file)
+  if File.exist?(cfg_file) || base_file
     begin
-      data = JSON.parse(File.read(cfg_file))
-      
+      raw_prof = load_profile_raw_config(profile_dir)
+      data = compile_profile_config(num)
+
       puts bold("Model Configuration:")
-      puts "  • Description:   #{bold(cyan(data['description']))}" if data['description']
+      puts "  • Description:   #{bold(cyan(raw_prof['description'] || data['description']))}" if raw_prof['description'] || data['description']
       puts "  • Default Model: #{cyan(data['model'] || '(not set)')}"
       puts "  • Small Model:   #{cyan(data['small_model'] || '(not set)')}" if data['small_model']
       puts "  • Instructions:  #{data['instructions'].inspect}" if data['instructions']
+      puts "  • Plugins:       #{data['plugin'].inspect}" if data['plugin']
       puts ""
 
       puts bold("Providers & Access Points (Base URLs):")
@@ -570,7 +664,7 @@ def show_profile_info(num_str = nil)
           puts "  └─────────────────────────────────────────"
         end
       else
-        puts "  #{yellow('No custom providers defined in config.json')}"
+        puts "  #{yellow('No custom providers defined')}"
       end
 
       if data['agent'].is_a?(Hash)
@@ -582,10 +676,10 @@ def show_profile_info(num_str = nil)
       end
 
     rescue StandardError => e
-      puts red("Failed to parse config.json: #{e.message}")
+      puts red("Failed to parse config: #{e.message}")
     end
   else
-    puts red("Missing config.json file")
+    puts red("Missing config file")
   end
   puts ""
 end
@@ -602,28 +696,31 @@ def set_profile_model(num_str, model_name)
     exit 1
   end
 
-  cfg_file = File.join(profile_dir, 'config.json')
-  unless File.exist?(cfg_file)
-    warn red("Error: config.json not found in #{profile_dir}")
+  cfg_file = find_profile_config_file(profile_dir)
+  unless cfg_file && File.exist?(cfg_file)
+    warn red("Error: config file not found in #{profile_dir}")
     exit 1
   end
 
-  data = JSON.parse(File.read(cfg_file)) rescue nil
+  data = parse_jsonc(File.read(cfg_file)) rescue nil
   unless data
-    warn red("Error: Invalid JSON in #{cfg_file}")
+    warn red("Error: Invalid JSON/JSONC in #{cfg_file}")
     exit 1
   end
+
+  effective_data = compile_profile_config(num)
+  all_providers = (data['provider'] || {}).merge(effective_data['provider'] || {})
 
   final_model = model_name
-  if !final_model.include?('/') && data['provider'].is_a?(Hash)
+  if !final_model.include?('/') && all_providers.is_a?(Hash)
     matching_provider = nil
-    data['provider'].each do |p_id, p_info|
+    all_providers.each do |p_id, p_info|
       if p_info['models'].is_a?(Hash) && p_info['models'].key?(final_model)
         matching_provider = p_id
         break
       end
     end
-    matching_provider ||= data['provider'].keys.first if data['provider'].size == 1
+    matching_provider ||= all_providers.keys.first if all_providers.size == 1
     final_model = "#{matching_provider}/#{final_model}" if matching_provider
   end
 
@@ -640,8 +737,7 @@ def set_profile_model(num_str, model_name)
   File.write(cfg_file, JSON.pretty_generate(data))
 
   if num == get_default_profile
-    FileUtils.rm_f(TARGET_CFG)
-    FileUtils.cp(cfg_file, TARGET_CFG)
+    compile_and_switch_profile(num)
   end
 
   puts green("✓ Default model set to #{bold(cyan(final_model))} for Profile #{bold(num)}")
@@ -659,11 +755,11 @@ def test_profile(num_str = nil, custom_prompt = nil)
     exit 1
   end
 
-  cfg_file = File.join(profile_dir, 'config.json')
+  cfg_file = find_profile_config_file(profile_dir)
   api_file = File.join(profile_dir, 'API_key.sh')
 
-  unless File.exist?(cfg_file)
-    warn red("Error: config.json missing in #{profile_dir}")
+  unless cfg_file && File.exist?(cfg_file)
+    warn red("Error: config file missing in #{profile_dir}")
     exit 1
   end
 
@@ -679,10 +775,10 @@ def test_profile(num_str = nil, custom_prompt = nil)
     end
   end
 
-  data = JSON.parse(File.read(cfg_file)) rescue {}
+  data = compile_profile_config(num)
   model = data['model']
   unless model
-    warn red("Error: No model configured in #{cfg_file}")
+    warn red("Error: No model configured in profile #{num}")
     exit 1
   end
 
@@ -697,9 +793,8 @@ def test_profile(num_str = nil, custom_prompt = nil)
   puts "  Base URL: #{green(base_url || '(default)')}"
   puts "  Sending test prompt to model endpoint..."
 
-  FileUtils.rm_f(TARGET_CFG)
-  FileUtils.rm_f(TARGET_JSONC)
-  FileUtils.cp(cfg_file, TARGET_CFG)
+  # Compile active config for opencode runner
+  compile_and_switch_profile(num)
 
   prompt = custom_prompt || "Respond with exact text: Hello from Profile #{num}"
   test_cmd = ['opencode', 'run', prompt, '-m', model]
@@ -763,15 +858,15 @@ def benchmark_profiles(profile_list = [], custom_prompt = nil, max_tokens = 400)
 
   targets.each do |num|
     p_dir = File.join(SWITCH_DIR, num.to_s)
-    cfg_file = File.join(p_dir, 'config.json')
+    cfg_file = find_profile_config_file(p_dir)
     api_file = File.join(p_dir, 'API_key.sh')
 
-    unless File.exist?(cfg_file)
-      warn red("Profile #{num}: config.json not found.")
+    unless cfg_file && File.exist?(cfg_file)
+      warn red("Profile #{num}: config file not found.")
       next
     end
 
-    data = JSON.parse(File.read(cfg_file)) rescue {}
+    data = compile_profile_config(num)
     model = data['model']
     provider_info = data['provider']&.values&.first || {}
     provider_id = data['provider']&.keys&.first || 'provider'
@@ -879,15 +974,15 @@ def test_models_in_profile(num_str = nil, custom_prompt = nil, max_tokens = 400)
     exit 1
   end
 
-  cfg_file = File.join(profile_dir, 'config.json')
+  cfg_file = find_profile_config_file(profile_dir)
   api_file = File.join(profile_dir, 'API_key.sh')
 
-  unless File.exist?(cfg_file)
-    warn red("Error: config.json not found in #{profile_dir}")
+  unless cfg_file && File.exist?(cfg_file)
+    warn red("Error: config file not found in #{profile_dir}")
     exit 1
   end
 
-  data = JSON.parse(File.read(cfg_file)) rescue {}
+  data = compile_profile_config(num)
   provider_info = data['provider']&.values&.first || {}
   provider_id = data['provider']&.keys&.first || 'provider'
   provider_name = provider_info['name'] || provider_id
@@ -997,6 +1092,216 @@ def test_models_in_profile(num_str = nil, custom_prompt = nil, max_tokens = 400)
       puts green("⚡ Fastest model in Profile #{num} is #{bold(fastest[:id])} at #{fastest[:speed]} tok/s (#{ratio}x faster than #{slowest[:id]})")
     end
   end
+end
+
+# Migrate existing monolithic profile configs into layered base.jsonc + compact deltas
+def migrate_profiles(args = [])
+  ensure_initialized
+
+  dry_run = true
+  if args.any? { |a| a =~ /^(--apply|-y|--yes|apply)$/i }
+    dry_run = false
+  end
+
+  puts bold(dry_run ? "🔍 [DRY RUN] Analyzing profiles for base extraction..." : "🚀 Migrating profiles to layered base.jsonc architecture...")
+  puts ""
+
+  profiles = available_profile_nums
+  if profiles.empty?
+    warn red("No profiles found in #{SWITCH_DIR}")
+    return
+  end
+
+  # 1. Load all profile configurations
+  raw_configs = {}
+  profiles.each do |p_num|
+    p_dir = File.join(SWITCH_DIR, p_num)
+    cfg_file = find_profile_config_file(p_dir)
+    next unless cfg_file && File.exist?(cfg_file)
+    raw_configs[p_num] = {
+      path: cfg_file,
+      content: (parse_jsonc(File.read(cfg_file)) rescue {})
+    }
+  end
+
+  # 2. Extract candidate base invariants
+  # Collect all plugins declared across all profiles
+  all_plugins = raw_configs.values.flat_map { |v| v[:content]['plugin'] }.compact
+  all_plugins = all_plugins.is_a?(Array) ? all_plugins.flatten.uniq : []
+  # Ensure standard plugins like open-mem and tokenscope are present
+  default_plugins = ['open-mem', '@ramtinj95/opencode-tokenscope']
+  base_plugins = (default_plugins + all_plugins).uniq
+
+  base_cfg = {
+    '$schema' => 'https://opencode.ai/config.json',
+    'lsp' => true,
+    'formatter' => true,
+    'instructions' => ['AGENTS.md'],
+    'compaction' => {
+      'auto' => true,
+      'tail_turns' => 15
+    },
+    'plugin' => base_plugins
+  }
+
+  base_jsonc_text = <<~JSONC
+    {
+      "$schema": "https://opencode.ai/config.json",
+      "lsp": true,
+      "formatter": true,
+      "instructions": [
+        "AGENTS.md"
+      ],
+      "compaction": {
+        "auto": true,
+        "tail_turns": 15
+      },
+      // Universal plugins loaded across all profiles
+      "plugin": #{JSON.pretty_generate(base_plugins).gsub("\n", "\n  ")}
+    }
+  JSONC
+
+  # 3. Compute deltas for each profile
+  deltas = {}
+  stats = []
+
+  raw_configs.each do |p_num, info|
+    orig = info[:content]
+    delta = orig.dup
+
+    stripped_keys = []
+
+    # Strip invariant top-level keys
+    %w[$schema lsp formatter].each do |k|
+      if delta.key?(k)
+        delta.delete(k)
+        stripped_keys << k
+      end
+    end
+
+    # Strip instructions if standard ["AGENTS.md"]
+    if delta['instructions'] == ['AGENTS.md']
+      delta.delete('instructions')
+      stripped_keys << 'instructions'
+    end
+
+    # Strip plugin if it is fully subsumed by base
+    if delta['plugin'].is_a?(Array)
+      if (delta['plugin'] - base_plugins).empty?
+        delta.delete('plugin')
+        stripped_keys << 'plugin'
+      else
+        delta['plugin'] = (delta['plugin'] - base_plugins)
+        stripped_keys << 'plugin (custom kept)'
+      end
+    end
+
+    # Strip compaction if identical to base, or strip identical subkeys
+    if delta['compaction'].is_a?(Hash)
+      if delta['compaction'] == { 'auto' => true, 'tail_turns' => 15 }
+        delta.delete('compaction')
+        stripped_keys << 'compaction'
+      else
+        # If it has custom fields like prune: true, reserved: 32000, remove auto: true if standard
+        comp = delta['compaction'].dup
+        comp.delete('auto') if comp['auto'] == true
+        comp.delete('tail_turns') if comp['tail_turns'] == 15
+        delta['compaction'] = comp unless comp.empty?
+        delta.delete('compaction') if comp.empty?
+        stripped_keys << 'compaction (custom delta kept)'
+      end
+    end
+
+    orig_lines = JSON.pretty_generate(orig).lines.size
+    new_lines = JSON.pretty_generate(delta).lines.size
+    reduction_pct = (((orig_lines - new_lines).to_f / orig_lines) * 100).round(1)
+
+    deltas[p_num] = delta
+    stats << {
+      num: p_num,
+      orig_lines: orig_lines,
+      new_lines: new_lines,
+      reduction_pct: reduction_pct,
+      stripped_keys: stripped_keys
+    }
+  end
+
+  # Display Summary Table
+  puts bold("=== Base Configuration to be created (~/.config/opencode-switcher/base.jsonc) ===")
+  puts base_jsonc_text
+  puts bold("=== Profile Delta Extraction Plan ===")
+  puts sprintf("  %-8s %-12s %-12s %-12s %s", "Profile", "Original", "New Delta", "Reduction", "Keys Moved to Base")
+  puts "  " + ("-" * 75)
+
+  total_orig = 0
+  total_new = 0
+  stats.each do |s|
+    total_orig += s[:orig_lines]
+    total_new += s[:new_lines]
+    puts sprintf("  %-8s %-12s %-12s %-12s %s",
+      cyan(s[:num]),
+      "#{s[:orig_lines]} lines",
+      "#{s[:new_lines]} lines",
+      green("-#{s[:reduction_pct]}%"),
+      s[:stripped_keys].join(', ')
+    )
+  end
+
+  total_reduction = (((total_orig - total_new).to_f / total_orig) * 100).round(1)
+  puts "  " + ("-" * 75)
+  puts sprintf("  %-8s %-12s %-12s %-12s",
+    bold("TOTAL"),
+    "#{total_orig} lines",
+    "#{total_new} lines",
+    bold(green("-#{total_reduction}% (#{total_orig - total_new} lines removed)"))
+  )
+  puts ""
+
+  if dry_run
+    puts yellow("ℹ DRY RUN COMPLETE: No files were modified.")
+    puts "To apply this migration, run:"
+    puts "  #{bold(green("oc conf migrate --apply"))}"
+    return
+  end
+
+  # 4. Perform actual migration
+  timestamp = Time.now.strftime('%Y%m%d_%H%M%S')
+  backup_dir = File.join(SWITCH_DIR, ".backup_#{timestamp}")
+  FileUtils.mkdir_p(backup_dir)
+
+  puts cyan("Creating backup at #{backup_dir} ...")
+  profiles.each do |p_num|
+    src_dir = File.join(SWITCH_DIR, p_num)
+    dest_dir = File.join(backup_dir, p_num)
+    FileUtils.cp_r(src_dir, dest_dir)
+  end
+  puts green("✓ Backup created successfully.")
+
+  # Write base.jsonc
+  base_path = File.join(SWITCH_DIR, 'base.jsonc')
+  File.write(base_path, base_jsonc_text)
+  puts green("✓ Wrote #{base_path}")
+
+  # Write profile deltas as config.jsonc
+  deltas.each do |p_num, delta_data|
+    p_dir = File.join(SWITCH_DIR, p_num)
+    old_json = File.join(p_dir, 'config.json')
+    new_jsonc = File.join(p_dir, 'config.jsonc')
+
+    File.write(new_jsonc, JSON.pretty_generate(delta_data))
+    FileUtils.rm_f(old_json) if File.exist?(old_json)
+  end
+  puts green("✓ Updated #{deltas.size} profiles with compact deltas (converted to config.jsonc).")
+
+  # Recompile active profile
+  active_num = get_default_profile
+  if active_num
+    compile_and_switch_profile(active_num)
+    puts green("✓ Recompiled active profile #{bold(active_num)} to #{TARGET_CFG}")
+  end
+
+  puts ""
+  puts bold(green("🎉 Migration successfully completed! All profiles now inherit from base.jsonc."))
 end
 
 # Install oc and opencode-switcher to a binary directory in PATH
@@ -1260,6 +1565,7 @@ def print_usage
   puts "  oc conf set_desc [num] <desc>      Set description for a profile"
   puts "  oc conf set_api <num> <key>        Set API key for a profile"
   puts "  oc conf create <config.json>       Create a new profile from a JSON config"
+  puts "  oc conf migrate [--apply]          Extract universal keys to base.jsonc (dry-run by default)"
   puts "  oc conf install [dir]              Install oc and opencode-switcher to PATH"
   puts "  oc conf ssh <remote> [-all]        Sync oc and config to a remote machine"
   puts "  oc conf version                    Show opencode-switcher version"
@@ -1299,6 +1605,9 @@ def dispatch_config_command(args)
   cmd = args.shift
 
   case cmd
+  when 'migrate', 'consolidate', 'extract_base', 'extract-base'
+    migrate_profiles(args)
+
   when 'test_models', 'test-models', 'bench_models', 'bench-models', 'models_speed', 'speed_models'
     num = args.shift
     test_models_in_profile(num, args.join(' ').empty? ? nil : args.join(' '))
@@ -1540,24 +1849,10 @@ if File.exist?(api_script)
   end
 end
 
-# 2. Copy config.json over to active ~/.config/opencode/opencode.json and clean shadowing files
-FileUtils.rm_f(TARGET_JSONC)
-
-cfg_src = File.join(profile_dir, 'config.json')
-profile_model = nil
-profile_data = nil
-
-if File.exist?(cfg_src)
-  FileUtils.rm_f(TARGET_CFG)
-  FileUtils.cp(cfg_src, TARGET_CFG)
-  begin
-    profile_data = JSON.parse(File.read(cfg_src))
-    profile_model = profile_data['model']
-  rescue StandardError
-  end
-else
-  warn yellow("Warning: Missing #{cfg_src}")
-end
+# 2. Compile and activate effective configuration in ~/.config/opencode/opencode.json
+profile_data = compile_profile_config(target_profile_num)
+compile_and_switch_profile(target_profile_num)
+profile_model = profile_data['model']
 
 # 3. Handle model forwarding if not explicitly supplied
 has_model_flag = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }
