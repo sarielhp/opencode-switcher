@@ -112,8 +112,8 @@ else
   puts yellow("  Skipping main fast-forward (current branch is '#{current_branch}', not 'dev')")
 end
 
-# 4. Tag on GitHub
-gh('tag', 'create', "v#{new_version}", '--message', "Release v#{new_version}")
-puts green("  ✓ Tagged v#{new_version} on GitHub")
+# 4. Publish a GitHub release (also creates the tag)
+gh('release', 'create', "v#{new_version}", '--title', "v#{new_version}", '--generate-notes')
+puts green("  ✓ Released v#{new_version} on GitHub")
 
 puts bold("Done: v#{old_version} -> v#{new_version}")

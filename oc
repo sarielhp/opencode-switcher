@@ -6,8 +6,9 @@ require 'json'
 require 'open3'
 require 'net/http'
 require 'uri'
+require 'shellwords'
 
-VERSION      = '0.1.2'
+VERSION      = '0.1.3'
 SWITCH_DIR   = File.expand_path('~/.config/opencode-switcher')
 LEGACY_DIRS  = [
   File.expand_path('~/.config/opencode_switch'),
@@ -70,7 +71,7 @@ def available_profile_nums
   Dir.glob(File.join(SWITCH_DIR, '[0-9]*'))
      .select { |p| File.directory?(p) }
      .map { |p| File.basename(p) }
-     .sort
+     .sort_by { |n| [n.to_i, n] }
 end
 
 # Get current default profile number from default.json
@@ -78,7 +79,8 @@ def get_default_profile
   if File.exist?(DEFAULT_FILE)
     begin
       data = JSON.parse(File.read(DEFAULT_FILE))
-      return format_num(data['default']) if data['default']
+      num = format_num(data['default']) unless data['default'].nil?
+      return num if num
     rescue StandardError
       # Ignore read errors
     end
@@ -94,8 +96,9 @@ def parse_jsonc(content)
   cleaned = content.gsub(/("(?:[^"\\]|\\.)*")|(\/\*[\s\S]*?\*\/|\/\/[^\n]*)/) do
     $1 ? $1 : ''
   end
-  # Remove trailing commas before closing braces/brackets
-  cleaned = cleaned.gsub(/,\s*([\]}])/, '\1')
+  # Remove trailing commas before closing braces/brackets. Strings are matched
+  # first so a value like "a, }" is never altered.
+  cleaned = cleaned.gsub(/("(?:[^"\\]|\\.)*")|,(\s*(?=[\]}]))/) { $1 ? $1 : $2 }
   JSON.parse(cleaned)
 end
 
@@ -186,6 +189,33 @@ def load_profile_env(num_str)
   end
 end
 
+# Read the variables exported by a profile's API_key.sh without guessing at
+# quoting: source it in a subshell and diff the environment against a clean
+# base. Returns an ordered array of [name, value] pairs (values are the actual
+# shell-interpreted strings, so escapes/quotes are handled correctly).
+def read_profile_api_vars(api_script)
+  return [] unless api_script && File.exist?(api_script)
+
+  base_out, = Open3.capture2('bash', '-c', 'env -0')
+  sourced_cmd = "set -a; source '#{api_script}' >/dev/null 2>&1; env -0"
+  env_out, status = Open3.capture2('bash', '-c', sourced_cmd)
+  return [] unless status.success?
+
+  base = {}
+  base_out.split("\0").each do |pair|
+    k, v = pair.split('=', 2)
+    base[k] = v if k && !k.empty?
+  end
+
+  vars = []
+  env_out.split("\0").each do |pair|
+    k, v = pair.split('=', 2)
+    next unless k && !k.empty?
+    vars << [k, v] if !base.key?(k) || base[k] != v
+  end
+  vars
+end
+
 # Reload or restart running OpenCode service (if running in OpenCode 2.0)
 def reload_opencode_service(restart: false)
   bin = locate_opencode_bin
@@ -248,6 +278,17 @@ def run_has_message?(args)
 end
 
 
+# Atomically write content to a file (write temp file in the same dir, then rename)
+def atomic_write(path, content)
+  tmp = "#{path}.tmp.#{Process.pid}"
+  begin
+    File.write(tmp, content)
+    File.rename(tmp, path)
+  ensure
+    FileUtils.rm_f(tmp) if File.exist?(tmp)
+  end
+end
+
 # Compile and activate profile in ~/.config/opencode/opencode.json
 def compile_and_switch_profile(num_str, reload: true)
   num = format_num(num_str)
@@ -267,10 +308,9 @@ def compile_and_switch_profile(num_str, reload: true)
 
   # Remove shadowing files and atomically write compiled opencode.json
   FileUtils.rm_f(TARGET_JSONC)
-  FileUtils.rm_f(TARGET_CFG)
-  File.write(TARGET_CFG, JSON.pretty_generate(final_cfg))
+  atomic_write(TARGET_CFG, JSON.pretty_generate(final_cfg))
 
-  File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
+  atomic_write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
   reload_opencode_service(restart: true) if reload
   final_cfg
 end
@@ -328,8 +368,10 @@ def detect_api_env_vars(json_data)
   vars.uniq
 end
 
-# Ensure JSON config uses {env:VAR_NAME} placeholders for apiKey fields
-def inject_env_placeholders!(json_data, env_var_map)
+# Ensure JSON config uses {env:VAR_NAME} placeholders for apiKey fields.
+# When `only` is provided, it restricts rewriting to the listed provider names
+# (providers outside the list are left exactly as-is).
+def inject_env_placeholders!(json_data, env_var_map, only: nil)
   update_obj = lambda do |obj, provider_name|
     if obj.is_a?(Hash)
       obj.each do |k, v|
@@ -338,8 +380,9 @@ def inject_env_placeholders!(json_data, env_var_map)
             update_obj.call(p_val, p_name)
           end
         elsif k.to_s =~ /apiKey/i && v.is_a?(String)
-          if v !~ /\{env:[^}]+\}/
-            var = env_var_map[provider_name] || "#{provider_name.to_s.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+          if v !~ /\{env:[^}]+\}/ && (only.nil? || only.include?(provider_name))
+            var = env_var_map[provider_name] ||
+                  "#{provider_name.to_s.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
             obj[k] = "{env:#{var}}"
           end
         else
@@ -352,6 +395,35 @@ def inject_env_placeholders!(json_data, env_var_map)
   end
 
   update_obj.call(json_data, nil)
+end
+
+# Conventional API key env var name for a provider id
+def conventional_api_var(provider_name)
+  "#{provider_name.to_s.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
+end
+
+# Build a provider-keyed env var map for set_api_key so that a key update only
+# rewrites the apiKey of the provider it belongs to. Providers whose var name
+# cannot be matched to the requested var are left untouched (their literal keys
+# are preserved), avoiding collapsing every provider onto a single variable.
+def build_api_var_map(json_data, var_name)
+  providers = json_data.is_a?(Hash) && json_data['provider'].is_a?(Hash) ? json_data['provider'] : {}
+  candidates = providers.select do |p_name, p_val|
+    next false unless p_val.is_a?(Hash) && p_val['options'].is_a?(Hash)
+    p_val['options']['apiKey'].is_a?(String)
+  end
+
+  map = {}
+  candidates.each_key do |p_name|
+    map[p_name] = var_name if conventional_api_var(p_name) == var_name
+  end
+
+  # Fall back to the sole provider holding an apiKey when the var name is custom
+  if map.empty? && candidates.size == 1
+    map[candidates.keys.first] = var_name
+  end
+
+  map
 end
 
 # Check and perform first-time setup
@@ -399,7 +471,7 @@ def ensure_initialized
     script_content = <<~SH
       #!/usr/bin/env bash
       # API Key configuration for Profile 01
-      export #{primary_var}="#{key_to_set}"
+      export #{primary_var}=#{Shellwords.escape(key_to_set.to_s)}
     SH
 
     api_script = File.join(profile_1_dir, 'API_key.sh')
@@ -476,8 +548,7 @@ def list_profiles
     # Check API key status in API_key.sh
     key_info = ''
     if File.exist?(api_file)
-      api_content = File.read(api_file)
-      var_matches = api_content.scan(/export\s+([A-Za-z0-9_]+)=["']?([^"'\n]*)["']?/)
+      var_matches = read_profile_api_vars(api_file)
       if var_matches.any?
         var_summaries = var_matches.map do |var, val|
           val_display = val.strip.empty? ? red('EMPTY') : green('SET')
@@ -585,7 +656,7 @@ def create_profile(json_path)
   api_script_content = <<~SH
     #!/usr/bin/env bash
     # API key environment configuration for Profile #{next_num}
-    export #{primary_var}="#{key_to_set}"
+    export #{primary_var}=#{Shellwords.escape(key_to_set.to_s)}
   SH
 
   dest_api = File.join(profile_dir, 'API_key.sh')
@@ -634,7 +705,7 @@ def set_api_key(num_str, api_key_value)
   script_content = <<~SH
     #!/usr/bin/env bash
     # API key environment configuration for Profile #{num}
-    export #{var_name}="#{api_key_value}"
+    export #{var_name}=#{Shellwords.escape(api_key_value.to_s)}
   SH
 
   File.write(api_file, script_content)
@@ -643,7 +714,8 @@ def set_api_key(num_str, api_key_value)
   if cfg_file && File.exist?(cfg_file)
     json_data = parse_jsonc(File.read(cfg_file)) rescue nil
     if json_data
-      inject_env_placeholders!(json_data, { nil => var_name })
+      var_map = build_api_var_map(json_data, var_name)
+      inject_env_placeholders!(json_data, var_map, only: var_map.keys)
       File.write(cfg_file, JSON.pretty_generate(json_data))
     end
   end
@@ -688,8 +760,7 @@ def show_profile_info(num_str = nil)
 
   puts bold("Environment & API Keys (from API_key.sh):")
   if File.exist?(api_file)
-    api_content = File.read(api_file)
-    var_matches = api_content.scan(/export\s+([A-Za-z0-9_]+)=["']?([^"'\n]*)["']?/)
+    var_matches = read_profile_api_vars(api_file)
     if var_matches.any?
       var_matches.each do |var, val|
         masked = mask_key(val)
@@ -834,7 +905,7 @@ def set_profile_model(num_str, model_name)
 end
 
 # Test profile connectivity and model response
-def test_profile(num_str = nil, custom_prompt = nil)
+def test_profile(num_str = nil, custom_prompt = nil, abort_on_error: true)
   ensure_initialized
   num = format_num(num_str) || get_default_profile
   profile_dir = File.join(SWITCH_DIR, num.to_s)
@@ -842,7 +913,8 @@ def test_profile(num_str = nil, custom_prompt = nil)
   unless num && Dir.exist?(profile_dir)
     warn red("Error: Profile '#{num_str}' does not exist.")
     warn "Available profiles: #{available_profile_nums.join(', ')}"
-    exit 1
+    exit 1 if abort_on_error
+    return false
   end
 
   cfg_file = find_profile_config_file(profile_dir)
@@ -850,7 +922,8 @@ def test_profile(num_str = nil, custom_prompt = nil)
 
   unless cfg_file && File.exist?(cfg_file)
     warn red("Error: config file missing in #{profile_dir}")
-    exit 1
+    exit 1 if abort_on_error
+    return false
   end
 
   custom_env = {}
@@ -869,7 +942,8 @@ def test_profile(num_str = nil, custom_prompt = nil)
   model = data['model']
   unless model
     warn red("Error: No model configured in profile #{num}")
-    exit 1
+    exit 1 if abort_on_error
+    return false
   end
 
   base_url = nil
@@ -886,8 +960,15 @@ def test_profile(num_str = nil, custom_prompt = nil)
   # Compile active config for opencode runner
   compile_and_switch_profile(num)
 
+  opencode_bin = locate_opencode_bin
+  unless opencode_bin
+    warn red("Error: Could not locate 'opencode' binary.")
+    exit 1 if abort_on_error
+    return false
+  end
+
   prompt = custom_prompt || "Respond with exact text: Hello from Profile #{num}"
-  test_cmd = ['opencode', 'run', '--standalone', '-m', model, prompt]
+  test_cmd = [opencode_bin, 'run', '--standalone', '-m', model, prompt]
 
   start_t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   merged_env = ENV.to_h.merge(custom_env)
@@ -919,7 +1000,7 @@ def test_all_profiles
   results = {}
   profiles.each do |p|
     puts '--------------------------------------------------'
-    success = test_profile(p)
+    success = test_profile(p, nil, abort_on_error: false)
     results[p] = success
     puts ''
   end
@@ -965,9 +1046,8 @@ def benchmark_profiles(profile_list = [], custom_prompt = nil, max_tokens = 400)
 
     api_key = ''
     if File.exist?(api_file)
-      content = File.read(api_file)
-      match = content.scan(/export\s+[A-Za-z0-9_]+=["']?([^"'\n]*)["']?/).flatten.first
-      api_key = match if match
+      api_vars = read_profile_api_vars(api_file)
+      api_key = api_vars.first ? api_vars.first[1] : ''
     end
 
     raw_model = model.to_s.strip
@@ -1005,7 +1085,6 @@ def benchmark_profiles(profile_list = [], custom_prompt = nil, max_tokens = 400)
     if res && res.is_a?(Net::HTTPSuccess)
       res_json = JSON.parse(res.body) rescue {}
       tokens_out = res_json.dig('usage', 'completion_tokens') || 0
-      tokens_in = res_json.dig('usage', 'prompt_tokens') || 0
       speed = tokens_out > 0 && total_time > 0 ? (tokens_out / total_time).round(1) : 0
 
       puts green("#{speed} tok/s") + " (#{tokens_out} tokens in #{total_time}s)"
@@ -1080,9 +1159,8 @@ def test_models_in_profile(num_str = nil, custom_prompt = nil, max_tokens = 400)
 
   api_key = ''
   if File.exist?(api_file)
-    content = File.read(api_file)
-    match = content.scan(/export\s+[A-Za-z0-9_]+=["']?([^"'\n]*)["']?/).flatten.first
-    api_key = match if match
+    api_vars = read_profile_api_vars(api_file)
+    api_key = api_vars.first ? api_vars.first[1] : ''
   end
 
   configured_models = provider_info['models']
@@ -1690,7 +1768,7 @@ def dispatch_config_command(args)
 
   when 'test', 'check', 'verify', 'diag'
     target = args.shift
-    if target =~ /^(all|--all|-a)$/i
+    if target && target =~ /^(all|--all|-a)$/i
       test_all_profiles
     else
       test_profile(target, args.join(' ').empty? ? nil : args.join(' '))
@@ -1698,7 +1776,7 @@ def dispatch_config_command(args)
 
   when 'info', 'show', 'inspect', 'view'
     target_num = args.shift
-    if target_num =~ /^(all|--all|-a)$/i
+    if target_num && target_num =~ /^(all|--all|-a)$/i
       available_profile_nums.each do |p|
         show_profile_info(p)
       end
@@ -1768,7 +1846,7 @@ def dispatch_config_command(args)
 
   else
     # Check if pattern is: oc conf <number> set_desc <desc>
-    if format_num(cmd) && args.first =~ /^(set_?desc|description|desc)$/i
+    if format_num(cmd) && args.first&.match?(/^(set_?desc|description|desc)$/i)
       args.shift
       desc = args.join(' ').strip
       if desc.empty?
@@ -1777,22 +1855,22 @@ def dispatch_config_command(args)
       end
       set_profile_description(cmd, desc)
     # Check if pattern is: oc conf <number> test_models
-    elsif format_num(cmd) && args.first =~ /^(test_?models|bench_?models|models_?speed)$/i
+    elsif format_num(cmd) && args.first&.match?(/^(test_?models|bench_?models|models_?speed)$/i)
       args.shift
       test_models_in_profile(cmd, args.join(' ').empty? ? nil : args.join(' '))
     # Check if pattern is: oc conf <number> bench
-    elsif format_num(cmd) && args.first =~ /^(benchmark|bench|speed)$/i
+    elsif format_num(cmd) && args.first&.match?(/^(benchmark|bench|speed)$/i)
       args.shift
       benchmark_profiles([cmd] + args)
     # Check if pattern is: oc conf <number> test / check
-    elsif format_num(cmd) && args.first =~ /^(test|check|verify|diag)$/i
+    elsif format_num(cmd) && args.first&.match?(/^(test|check|verify|diag)$/i)
       args.shift
       test_profile(cmd, args.join(' ').empty? ? nil : args.join(' '))
     # Check if pattern is: oc conf <number> info / show
-    elsif format_num(cmd) && args.first =~ /^(info|show|inspect)$/i
+    elsif format_num(cmd) && args.first&.match?(/^(info|show|inspect)$/i)
       show_profile_info(cmd)
     # Check if pattern is: oc conf <number> set_model <model>
-    elsif format_num(cmd) && args.first =~ /^(set_?model|model)$/i
+    elsif format_num(cmd) && args.first&.match?(/^(set_?model|model)$/i)
       args.shift
       model = args.shift
       if model.nil?
@@ -1801,7 +1879,7 @@ def dispatch_config_command(args)
       end
       set_profile_model(cmd, model)
     # Check if pattern is: oc conf <number> set_api <key>
-    elsif format_num(cmd) && args.first =~ /^set_?api$/i
+    elsif format_num(cmd) && args.first&.match?(/^set_?api$/i)
       args.shift
       key = args.shift
       if key.nil?
@@ -1855,14 +1933,14 @@ if version_arg?(args.first)
 end
 
 # Check for profile management namespace: oc conf, oc config, oc cfg, oc switch
-if args.first =~ /^(conf|config|cfg|switch)$/i
+if args.first&.match?(/^(conf|config|cfg|switch)$/i)
   args.shift
   dispatch_config_command(args)
   exit 0
 end
 
 # Check for install command: oc install [dir]
-if args.first =~ /^install$/i
+if args.first&.match?(/^install$/i)
   args.shift
   target = args.shift
   install_script(target, args)
@@ -1870,7 +1948,7 @@ if args.first =~ /^install$/i
 end
 
 # Check for remote sync command: oc ssh <remote> [-all]
-if args.first =~ /^(ssh|sync|remote)$/i
+if args.first&.match?(/^(ssh|sync|remote)$/i)
   args.shift
   host = args.shift
   sync_remote(host, args)
@@ -1878,9 +1956,11 @@ if args.first =~ /^(ssh|sync|remote)$/i
 end
 
 # Check for explicit passthrough delimiter: oc -- <args...>
+passthrough = false
 if args.first == '--'
   args.shift
   target_profile_num = get_default_profile
+  passthrough = true
 else
   # Check if first argument is a profile number (e.g. oc 02 or oc 2)
   target_profile_num = nil
@@ -1893,8 +1973,12 @@ else
   end
   target_profile_num ||= get_default_profile
 
-  # Strip optional '--' after profile number (e.g. oc 02 -- -m custom)
-  args.shift if args.first == '--'
+  # Strip optional '--' after profile number (e.g. oc 02 -- -m custom).
+  # Anything after '--' is forwarded verbatim to OpenCode.
+  if args.first == '--'
+    args.shift
+    passthrough = true
+  end
 end
 
 if target_profile_num.nil?
@@ -1919,14 +2003,16 @@ profile_model = profile_data['model']
 
 # 3. Model flag handling and argument transformation for OpenCode 2.0
 # If invoked as 'oc run' without a message argument, treat as wanting to start OpenCode interactively
-args.shift if args.first&.downcase == 'run' && !run_has_message?(args)
+args.shift if !passthrough && args.first&.downcase == 'run' && !run_has_message?(args)
 
 subcmd = args.first&.downcase
 is_model_subcmd = subcmd && MODEL_SUBCOMMANDS.include?(subcmd)
 is_known_subcmd = subcmd && OPENCODE_SUBCOMMANDS.include?(subcmd)
 
 
-if is_model_subcmd
+if passthrough
+  # Explicit '--' delimiter: forward all remaining arguments to OpenCode unchanged
+elsif is_model_subcmd
   has_model = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }
   args.insert(1, '-m', profile_model) if !has_model && profile_model
 elsif is_known_subcmd
@@ -1943,7 +2029,7 @@ else
         agent_cfg['model'] = model_override if agent_cfg.is_a?(Hash) && agent_cfg['model']
       end
     end
-    File.write(TARGET_CFG, JSON.pretty_generate(profile_data))
+    atomic_write(TARGET_CFG, JSON.pretty_generate(profile_data))
     reload_opencode_service(restart: true)
   end
 
