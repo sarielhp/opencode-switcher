@@ -470,6 +470,60 @@ ensure
   FileUtils.rm_rf(SBX)
 end
 
+# ===========================================================================
+# Diagnostics must not clobber the active default profile
+# ===========================================================================
+group 'compile_and_switch_profile activate_default'
+test 'activate_default: false compiles config but keeps default.json' do
+  reset_dirs
+  write_profile('01', model: 'prov/one')
+  write_profile('02', model: 'prov/two')
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  compile_and_switch_profile('02', reload: false, activate_default: false)
+  # opencode.json now holds profile 02's config...
+  assert_equal 'prov/two', JSON.parse(File.read(TARGET_CFG))['model']
+  # ...but default.json still points at 01.
+  assert_equal '01', JSON.parse(File.read(DEFAULT_FILE))['default']
+end
+test 'activate_default: true (default) updates default.json' do
+  reset_dirs
+  write_profile('01', model: 'prov/one')
+  write_profile('02', model: 'prov/two')
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  compile_and_switch_profile('02', reload: false)
+  assert_equal '02', JSON.parse(File.read(DEFAULT_FILE))['default']
+end
+
+group 'test_all_profiles restore'
+test 'preserves the active default and its compiled config' do
+  reset_dirs
+  write_profile('01', model: 'prov/one')
+  write_profile('02', model: 'prov/two')
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  # Prime the active config as if profile 01 were active.
+  compile_and_switch_profile('01', reload: false)
+  before_cfg = File.read(TARGET_CFG)
+  before_default = JSON.parse(File.read(DEFAULT_FILE))['default']
+
+  # Replace test_profile with a compile-only stub (no opencode/network) for the
+  # duration of this test, then run the real test_all_profiles.
+  Object.send(:alias_method, :__real_test_profile, :test_profile)
+  Object.send(:define_method, :test_profile) do |p, _prompt = nil, abort_on_error: false|
+    compile_and_switch_profile(p, reload: false, activate_default: false)
+    true
+  end
+  begin
+    test_all_profiles
+  ensure
+    Object.send(:alias_method, :test_profile, :__real_test_profile)
+  end
+
+  assert_equal before_default, JSON.parse(File.read(DEFAULT_FILE))['default'],
+               'default.json should be unchanged after test all'
+  assert_equal before_cfg, File.read(TARGET_CFG),
+               'active opencode.json should be restored after test all'
+end
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

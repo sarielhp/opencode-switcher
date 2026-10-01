@@ -325,7 +325,7 @@ def sweep_stale_tmp_files
 end
 
 # Compile and activate profile in ~/.config/opencode/opencode.json
-def compile_and_switch_profile(num_str, reload: true)
+def compile_and_switch_profile(num_str, reload: true, activate_default: true)
   num = format_num(num_str)
   profile_dir = File.join(SWITCH_DIR, num.to_s)
   unless num && Dir.exist?(profile_dir)
@@ -345,7 +345,9 @@ def compile_and_switch_profile(num_str, reload: true)
   FileUtils.rm_f(TARGET_JSONC)
   atomic_write(TARGET_CFG, JSON.pretty_generate(final_cfg))
 
-  atomic_write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
+  # Only persist the default profile when actually switching; diagnostic runs
+  # compile a profile without changing the active default.
+  atomic_write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num })) if activate_default
   reload_opencode_service(restart: true) if reload
   final_cfg
 end
@@ -997,8 +999,8 @@ def test_profile(num_str = nil, custom_prompt = nil, abort_on_error: true)
   puts "  Base URL: #{green(base_url || '(default)')}"
   puts "  Sending test prompt to model endpoint..."
 
-  # Compile active config for opencode runner
-  compile_and_switch_profile(num)
+  # Compile active config for opencode runner (do not change the active default)
+  compile_and_switch_profile(num, activate_default: false)
 
   opencode_bin = locate_opencode_bin
   unless opencode_bin
@@ -1037,6 +1039,11 @@ def test_all_profiles
   profiles = available_profile_nums
   puts bold("Running diagnostics on all #{profiles.size} profiles...\n")
 
+  # Remember the active default and its compiled config so diagnostics leave the
+  # environment exactly as it was.
+  active_num = get_default_profile
+  active_cfg = File.exist?(TARGET_CFG) ? File.read(TARGET_CFG) : nil
+
   results = {}
   profiles.each do |p|
     puts '--------------------------------------------------'
@@ -1045,12 +1052,22 @@ def test_all_profiles
     puts ''
   end
 
+  # Restore the previously active config (test_profile compiled each profile
+  # into TARGET_CFG for its run).
+  if active_cfg
+    atomic_write(TARGET_CFG, active_cfg)
+    reload_opencode_service(restart: true)
+  end
+
   puts bold("================ Test Summary ================")
   results.each do |p, success|
     status_str = success ? green("PASSED") : red("FAILED")
     puts "  Profile #{p}: #{status_str}"
   end
   puts bold("==============================================")
+  if active_num
+    puts "Active profile unchanged: #{cyan(active_num)}"
+  end
 end
 
 # Benchmark profile generation speed (tokens/sec and latency)
@@ -1340,18 +1357,6 @@ def migrate_profiles(args = [])
   default_plugins = ['open-mem', '@ramtinj95/opencode-tokenscope']
   base_plugins = (default_plugins + all_plugins).uniq
 
-  base_cfg = {
-    '$schema' => 'https://opencode.ai/config.json',
-    'lsp' => true,
-    'formatter' => true,
-    'instructions' => ['AGENTS.md'],
-    'compaction' => {
-      'auto' => true,
-      'tail_turns' => 15
-    },
-    'plugin' => base_plugins
-  }
-
   base_jsonc_text = <<~JSONC
     {
       "$schema": "https://opencode.ai/config.json",
@@ -1594,7 +1599,7 @@ def install_script(target_dir_arg = nil, extra_args = [])
       FileUtils.ln_s('oc', 'opencode-switcher')
     end
     puts green("✓ Created symlink #{bold(target_switcher)} -> oc")
-  rescue StandardError => e
+  rescue StandardError
     # Fallback to copy if symlinks are not supported
     FileUtils.cp(target_oc, target_switcher)
     FileUtils.chmod(0755, target_switcher)

@@ -66,8 +66,9 @@ Profiles are stored in `~/.config/opencode-switcher/`:
 ```
 ~/.config/opencode-switcher/
 ├── default.json          # Tracks active default profile number (e.g. {"default": "01"})
+├── base.jsonc            # Optional shared base config (all profiles inherit from it)
 ├── 01/
-│   ├── config.json       # OpenCode JSON configuration for Profile 01
+│   ├── config.json       # OpenCode JSON configuration for Profile 01 (or config.jsonc)
 │   └── API_key.sh        # Environment export script (e.g. export OPENROUTER_API_KEY="...")
 ├── 02/
 │   ├── config.json
@@ -77,9 +78,15 @@ Profiles are stored in `~/.config/opencode-switcher/`:
     └── API_key.sh
 ```
 
+Each profile's effective configuration is produced by deep-merging the optional
+shared `base.jsonc` with the profile's own `config.json`/`config.jsonc`. Arrays
+(such as `plugin` and `instructions`) are concatenated and de-duplicated; nested
+objects are merged recursively; primitives in the profile override the base. To
+extract common keys into `base.jsonc` automatically, see `oc conf migrate` below.
+
 When you invoke `oc [profile]`, the script:
 1. Sources `API_key.sh` for the selected profile and exports the variables to the execution environment.
-2. Copies `config.json` to `~/.config/opencode/opencode.json` (and cleans up any conflicting `opencode.jsonc`).
+2. Compiles the effective configuration (base merged with the profile) and atomically writes it to `~/.config/opencode/opencode.json` (removing any conflicting `opencode.jsonc`).
 3. Forwards the profile's default model (via `-m <model>`) if none is explicitly provided.
 4. Executes the `opencode` binary with any supplied arguments.
 
@@ -107,11 +114,17 @@ oc 03 -m anthropic/claude-3-7-sonnet
 ```
 
 #### Pass raw arguments directly to OpenCode
-Use `--` to prevent `oc` from interpreting arguments:
+Use `--` to prevent `oc` from interpreting any of the arguments that follow. In
+passthrough mode `oc` performs **no** argument transformation: it does not inject
+or strip `-m`, does not rewrite a positional prompt into `--prompt`, and does not
+treat `run` specially. Everything is forwarded verbatim.
 ```bash
+# Forward everything after '--' to OpenCode unchanged
 oc -- --version
 oc 02 -- -m custom/model -f main.rb
 ```
+Without `--`, `oc` still manages arguments: `oc 02 -m custom/model` consumes the
+model override, and `oc 01 "some prompt"` is rewritten to pass `--prompt`.
 
 ---
 
@@ -182,6 +195,20 @@ oc conf create path/to/my-config.json
 ```
 This allocates the next available numeric directory (e.g. `04`), copies the JSON file, replaces literal API keys with `{env:...}` placeholders, and creates the corresponding `API_key.sh` file.
 
+#### Extract shared keys into `base.jsonc`
+Analyzes all profiles and moves universal keys (`$schema`, `lsp`, `formatter`,
+`instructions`, `compaction`, common `plugin`s) into a shared `base.jsonc`,
+leaving each profile as a compact delta:
+```bash
+# Preview the migration (dry run; no files changed)
+oc conf migrate
+
+# Apply it (writes base.jsonc, rewrites profiles as config.jsonc, backs up first)
+oc conf migrate --apply
+```
+A timestamped backup of every profile is written to
+`~/.config/opencode-switcher/.backup_<timestamp>/` before any change.
+
 ---
 
 ### 3. Diagnostics & Benchmarking
@@ -195,6 +222,9 @@ oc conf test 01
 # Test all profiles
 oc conf test all
 ```
+Testing compiles each profile's config for the run but never changes the active
+default profile — after `oc conf test all`, `default.json` and the active
+`~/.config/opencode/opencode.json` are restored to their previous state.
 
 #### Benchmark token generation speed across profiles
 Measures latency and output tokens per second across multiple endpoints:
@@ -255,6 +285,32 @@ What `oc ssh <remote>` does:
 When `-all` is used, any existing remote `~/.config/opencode/AGENTS.md` is first backed up to `AGENTS.md.bak.NNN` (e.g. `.bak.001`, `.bak.002`, ...) using the lowest unused counter, so old configurations are never overwritten.
 
 The same command is available under the config namespace: `oc conf ssh <remote> [-all]`.
+
+---
+
+## Development
+
+Run the test suite (standard library only; no external gems, no network, no
+`opencode` binary required):
+
+```bash
+ruby tools/test.rb          # run all tests
+ruby tools/test.rb -v       # verbose (print every assertion)
+ruby tools/test.rb parse    # only tests matching a regex
+```
+
+The suite loads `oc`'s functions in an isolated temporary `HOME` and covers the
+JSONC parser, profile resolution, API-key injection/escaping, atomic writes, and
+the CLI argument-transformation logic. It runs in CI (`.github/workflows/test.yml`)
+on Ruby 3.0–3.3 for pushes and pull requests to `main` and `dev`.
+
+Version bumps and releases are scripted under `tools/`:
+
+```bash
+tools/bump.rb [major|minor|patch]   # bump VERSION in oc, commit and push
+tools/snapshot.rb [message]         # commit and push without a version bump
+tools/release.rb [major|minor|patch]# bump, push, fast-forward main, tag a release
+```
 
 ---
 
