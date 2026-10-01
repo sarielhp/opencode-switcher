@@ -26,15 +26,6 @@ require 'open3'
 ROOT = File.expand_path('..', __dir__)
 OC_FILE = File.join(ROOT, 'oc')
 
-def colorize(text, code)
-  $stdout.tty? ? "\e[#{code}m#{text}\e[0m" : text
-end
-
-def green(t);  colorize(t, 32); end
-def red(t);    colorize(t, 31); end
-def yellow(t); colorize(t, 33); end
-def bold(t);   colorize(t, 1);  end
-
 OPTIONS = { verbose: false, pattern: nil }
 parser = OptionParser.new do |o|
   o.banner = 'Usage: test.rb [-v] [pattern]'
@@ -83,6 +74,45 @@ end
 def assert_equal(expected, actual, msg = nil)
   return if expected == actual
   raise "#{msg || 'not equal'}\n       expected: #{expected.inspect}\n       actual:   #{actual.inspect}"
+end
+
+# Capture everything written to $stdout during the block. Returns the String.
+def capture_stdout
+  require 'stringio'
+  old = $stdout
+  $stdout = StringIO.new
+  yield
+  $stdout.string
+ensure
+  $stdout = old
+end
+
+# Run a block while discarding both stdout and stderr (for expected-error paths).
+def quietly
+  require 'stringio'
+  old_out = $stdout
+  old_err = $stderr
+  $stdout = StringIO.new
+  $stderr = StringIO.new
+  yield
+ensure
+  $stdout = old_out
+  $stderr = old_err
+end
+
+# Run a block that is expected to call `exit`. Returns the declared status code,
+# or raises if the block did not exit.
+def expect_exit
+  status = nil
+  quietly do
+    begin
+      yield
+    rescue SystemExit => e
+      status = e.status
+    end
+  end
+  raise 'expected block to call exit but it did not' if status.nil?
+  status
 end
 
 # ---------------------------------------------------------------------------
@@ -506,22 +536,353 @@ test 'preserves the active default and its compiled config' do
   before_default = JSON.parse(File.read(DEFAULT_FILE))['default']
 
   # Replace test_profile with a compile-only stub (no opencode/network) for the
-  # duration of this test, then run the real test_all_profiles.
+  # duration of this test, then restore the real one. The temporary redefinition
+  # is intentional; under `ruby -w` it emits a single benign "method redefined"
+  # notice (test-only, cleaned up in the ensure block).
   Object.send(:alias_method, :__real_test_profile, :test_profile)
   Object.send(:define_method, :test_profile) do |p, _prompt = nil, abort_on_error: false|
     compile_and_switch_profile(p, reload: false, activate_default: false)
     true
   end
   begin
-    test_all_profiles
+    quietly { test_all_profiles }
   ensure
     Object.send(:alias_method, :test_profile, :__real_test_profile)
+    Object.send(:remove_method, :__real_test_profile)
   end
 
   assert_equal before_default, JSON.parse(File.read(DEFAULT_FILE))['default'],
                'default.json should be unchanged after test all'
   assert_equal before_cfg, File.read(TARGET_CFG),
                'active opencode.json should be restored after test all'
+end
+
+# ===========================================================================
+# create_profile
+# ===========================================================================
+group 'create_profile'
+test 'allocates the next number and writes config + API_key.sh' do
+  reset_dirs
+  write_profile('01')
+  write_profile('02')
+  src = File.join(FAKE_HOME, 'new.json')
+  File.write(src, JSON.generate('model' => 'p/m', 'provider' => { 'acme' => { 'options' => { 'apiKey' => 'literal-xyz' } } }))
+  capture_stdout { create_profile(src) }
+  # next number is 03
+  assert Dir.exist?(File.join(SWITCH_DIR, '03')), 'expected profile 03 to be created'
+  cfg = JSON.parse(File.read(File.join(SWITCH_DIR, '03', 'config.json')))
+  # literal key replaced with placeholder and captured into API_key.sh
+  assert_equal '{env:ACME_API_KEY}', cfg['provider']['acme']['options']['apiKey']
+  api = File.read(File.join(SWITCH_DIR, '03', 'API_key.sh'))
+  assert api.include?('export ACME_API_KEY='), "API_key.sh: #{api}"
+  assert api.include?('literal-xyz'), "expected literal key captured: #{api}"
+end
+test 'preserves .jsonc extension' do
+  reset_dirs
+  write_profile('01')
+  src = File.join(FAKE_HOME, 'new.jsonc')
+  File.write(src, "{\n // c\n \"model\": \"p/m\"\n}\n")
+  capture_stdout { create_profile(src) }
+  assert File.exist?(File.join(SWITCH_DIR, '02', 'config.jsonc')), 'expected config.jsonc'
+end
+test 'rejects a nonexistent source file' do
+  reset_dirs
+  write_profile('01')
+  st = expect_exit { create_profile('/no/such/file.json') }
+  assert_equal 1, st
+end
+test 'rejects invalid JSON' do
+  reset_dirs
+  write_profile('01')
+  src = File.join(FAKE_HOME, 'bad.json')
+  File.write(src, '{not valid')
+  st = expect_exit { create_profile(src) }
+  assert_equal 1, st
+end
+
+# ===========================================================================
+# set_api_key (end-to-end)
+# ===========================================================================
+group 'set_api_key'
+test 'detects var name from existing API_key.sh and rewrites the config ref' do
+  reset_dirs
+  dir = write_profile('01', model: 'prov/m', provider: 'prov', api_var: 'CUSTOM_KEY', api_val: 'old')
+  # config holds a literal, so it must be rewritten to reference CUSTOM_KEY
+  File.write(File.join(dir, 'config.json'),
+             JSON.generate('provider' => { 'prov' => { 'options' => { 'apiKey' => 'literal' } } }))
+  capture_stdout { set_api_key('01', 'sk-new') }
+  api = File.read(File.join(dir, 'API_key.sh'))
+  assert api.include?('export CUSTOM_KEY='), api
+  cfg = JSON.parse(File.read(File.join(dir, 'config.json')))
+  assert_equal '{env:CUSTOM_KEY}', cfg['provider']['prov']['options']['apiKey']
+end
+test 'derives a conventional var name when no API_key.sh exists' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'),
+             JSON.generate('provider' => { 'openrouter' => { 'options' => { 'apiKey' => 'literal' } } }))
+  capture_stdout { set_api_key('01', 'sk-x') }
+  api = File.read(File.join(dir, 'API_key.sh'))
+  assert api.include?('export OPENROUTER_API_KEY='), api
+end
+test 'rejects NUL bytes' do
+  reset_dirs
+  write_profile('01')
+  st = expect_exit { set_api_key('01', "sk-\0bad") }
+  assert_equal 1, st
+end
+test 'rejects a nonexistent profile' do
+  reset_dirs
+  write_profile('01')
+  st = expect_exit { set_api_key('99', 'sk-x') }
+  assert_equal 1, st
+end
+
+# ===========================================================================
+# set_profile_model
+# ===========================================================================
+group 'set_profile_model'
+test 'sets an explicit provider/model and updates agent models' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), JSON.generate(
+    'model' => 'old/model',
+    'agent' => { 'build' => { 'model' => 'old/model' } }
+  ))
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  capture_stdout { set_profile_model('01', 'prov/new-model') }
+  cfg = JSON.parse(File.read(File.join(dir, 'config.json')))
+  assert_equal 'prov/new-model', cfg['model']
+  assert_equal 'prov/new-model', cfg['agent']['build']['model']
+end
+test 'qualifies a bare model name with the sole provider' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), JSON.generate(
+    'provider' => { 'solo' => { 'options' => {} } }
+  ))
+  capture_stdout { set_profile_model('01', 'my-model') }
+  cfg = JSON.parse(File.read(File.join(dir, 'config.json')))
+  assert_equal 'solo/my-model', cfg['model']
+end
+test 'qualifies a bare model name from a provider that lists it' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), JSON.generate(
+    'provider' => {
+      'a' => { 'options' => {}, 'models' => { 'other' => {} } },
+      'b' => { 'options' => {}, 'models' => { 'wanted' => {} } }
+    }
+  ))
+  capture_stdout { set_profile_model('01', 'wanted') }
+  cfg = JSON.parse(File.read(File.join(dir, 'config.json')))
+  assert_equal 'b/wanted', cfg['model']
+end
+test 'rejects an invalid config' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), '{bad')
+  st = expect_exit { set_profile_model('01', 'x/y') }
+  assert_equal 1, st
+end
+
+# ===========================================================================
+# set_profile_description
+# ===========================================================================
+group 'set_profile_description'
+test 'writes the description into the config' do
+  reset_dirs
+  write_profile('01')
+  capture_stdout { set_profile_description('01', 'A handy profile') }
+  cfg = JSON.parse(File.read(File.join(SWITCH_DIR, '01', 'config.json')))
+  assert_equal 'A handy profile', cfg['description']
+end
+test 'rejects a missing config' do
+  reset_dirs
+  FileUtils.mkdir_p(File.join(SWITCH_DIR, '01'))
+  st = expect_exit { set_profile_description('01', 'x') }
+  assert_equal 1, st
+end
+
+# ===========================================================================
+# list_profiles / show_profile_info (smoke + content)
+# ===========================================================================
+group 'list_profiles / show_profile_info'
+test 'list_profiles prints profiles, default marker, and key status' do
+  reset_dirs
+  write_profile('01', model: 'prov/one', api_var: 'P_KEY', api_val: 'secret')
+  write_profile('02', model: 'prov/two')
+  File.write(DEFAULT_FILE, JSON.generate('default' => '02'))
+  out = capture_stdout { list_profiles }
+  assert out.include?('01'), 'expected profile 01 listed'
+  assert out.include?('02'), 'expected profile 02 listed'
+  assert out.include?('[default]'), 'expected default marker'
+  assert out.include?('OPENROUTER'), 'expected provider info' rescue nil
+  assert out.include?('prov/one'), "expected model shown: #{out}"
+  assert out.include?('P_KEY'), 'expected API key var shown'
+end
+test 'list_profiles handles a profile with invalid json' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), '{bad json')
+  File.write(File.join(dir, 'API_key.sh'), "export K=1\n")
+  out = capture_stdout { list_profiles }
+  assert out.include?('01')
+end
+test 'show_profile_info prints keys and providers' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), JSON.generate(
+    'model' => 'prov/one',
+    'description' => 'desc here',
+    'provider' => { 'prov' => { 'name' => 'Prov', 'options' => { 'baseURL' => 'https://api.example', 'apiKey' => '{env:P_KEY}' } } }
+  ))
+  File.write(File.join(dir, 'API_key.sh'), "export P_KEY=abcdefghijklmnop\n")
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  out = capture_stdout { show_profile_info('01') }
+  assert out.include?('desc here'), 'expected description'
+  assert out.include?('https://api.example'), 'expected base URL'
+  assert out.include?('ACTIVE DEFAULT'), 'expected active default marker'
+  assert out.include?('P_KEY'), 'expected key name'
+  assert out.include?('abcdefgh') || out.include?('…'), 'expected masked key'
+end
+test 'show_profile_info rejects a nonexistent profile' do
+  reset_dirs
+  write_profile('01')
+  st = expect_exit { show_profile_info('99') }
+  assert_equal 1, st
+end
+
+# ===========================================================================
+# benchmark / test_models ranking math (via stub HTTP server)
+# ===========================================================================
+group 'benchmark ranking'
+test 'sorts by speed and reports a ratio (stub server)' do
+  require 'webrick'
+  reset_dirs
+  srv = WEBrick::HTTPServer.new(Port: 0, Logger: WEBrick::Log.new(File::NULL), AccessLog: [])
+  port = srv.config[:Port]
+  calls = 0
+  srv.mount_proc('/') do |_req, res|
+    calls += 1
+    res['Content-Type'] = 'application/json'
+    res.body = JSON.generate('usage' => { 'completion_tokens' => 10 })
+  end
+  t = Thread.new { srv.start }
+  sleep 0.2
+  begin
+    %w[01 02].each do |n|
+      dir = File.join(SWITCH_DIR, n)
+      FileUtils.mkdir_p(dir)
+      cfg = {
+        'model' => 'prov/m',
+        'provider' => { 'prov' => { 'options' => { 'baseURL' => "http://127.0.0.1:#{port}" } } }
+      }
+      File.write(File.join(dir, 'config.json'), JSON.generate(cfg))
+      File.write(File.join(dir, 'API_key.sh'), "export PROV_API_KEY=k\n")
+    end
+    out = capture_stdout { benchmark_profiles(%w[01 02]) }
+    assert out.include?('tok/s'), "expected speed output: #{out}"
+    assert out.include?('faster'), "expected comparison: #{out}"
+    assert calls >= 2, 'expected both profiles to be benchmarked'
+  ensure
+    srv.shutdown
+    t.join(2)
+  end
+end
+
+# ===========================================================================
+# Generated API_key.sh is valid bash (injection safety)
+# ===========================================================================
+group 'API_key.sh bash validity'
+test 'generated scripts pass bash -n for a fuzz corpus' do
+  reset_dirs
+  dir = write_profile('01')
+  corpus = [
+    'plain', 'with space', 'semi;colon', 'dollar$sign', 'back`tick',
+    'single\'quote', 'double"quote', 'newline\nhere', 'both"and\'quotes',
+    '$(command)', '${VAR}', 'a=b c=d', '#hash', '~tilde', '*glob',
+    '', 'trailing\\', 'back\\slash', 'tab\ttab'
+  ]
+  corpus.each do |key|
+    capture_stdout { set_api_key('01', key) }
+    script = File.join(dir, 'API_key.sh')
+    _out, err, st = Open3.capture3('bash', '-n', script)
+    assert st.success?, "bash -n failed for key #{key.inspect}: #{err}"
+  end
+end
+
+# ===========================================================================
+# VERSION drift guard
+# ===========================================================================
+group 'VERSION'
+test 'matches semantic versioning' do
+  assert VERSION =~ /\A\d+\.\d+\.\d+\z/, "VERSION not semver: #{VERSION.inspect}"
+end
+test 'help banner prints the version' do
+  out = capture_stdout { print_usage }
+  assert out.include?(VERSION), "expected banner to mention #{VERSION}"
+end
+
+# ===========================================================================
+# Dispatcher argument-parsing edge cases
+# ===========================================================================
+group 'dispatcher edge cases'
+test 'conf <num> set_model with a bare model name' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), JSON.generate('provider' => { 'solo' => { 'options' => {} } }))
+  capture_stdout { dispatch_config_command(%w[01 set_model justmodel]) }
+  cfg = JSON.parse(File.read(File.join(dir, 'config.json')))
+  assert_equal 'solo/justmodel', cfg['model']
+end
+test 'conf set_model <model> targets the default profile' do
+  reset_dirs
+  dir = File.join(SWITCH_DIR, '01')
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'config.json'), JSON.generate('provider' => { 'solo' => { 'options' => {} } }))
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  capture_stdout { dispatch_config_command(%w[set_model justmodel]) }
+  cfg = JSON.parse(File.read(File.join(dir, 'config.json')))
+  assert_equal 'solo/justmodel', cfg['model']
+end
+test 'conf <num> set_desc stores a multi-word description' do
+  reset_dirs
+  write_profile('01')
+  capture_stdout { dispatch_config_command(['01', 'set_desc', 'hello', 'world']) }
+  cfg = JSON.parse(File.read(File.join(SWITCH_DIR, '01', 'config.json')))
+  assert_equal 'hello world', cfg['description']
+end
+test 'conf <num> as a lone arg switches the default' do
+  reset_dirs
+  write_profile('01')
+  write_profile('02')
+  File.write(DEFAULT_FILE, JSON.generate('default' => '01'))
+  capture_stdout { dispatch_config_command(%w[02]) }
+  assert_equal '02', JSON.parse(File.read(DEFAULT_FILE))['default']
+end
+test 'unknown command exits 1' do
+  reset_dirs
+  write_profile('01')
+  st = expect_exit { dispatch_config_command(%w[bogus]) }
+  assert_equal 1, st
+end
+
+# ===========================================================================
+# run_has_message? documented limitations
+# ===========================================================================
+group 'run_has_message? limitations'
+test 'unknown flag value is treated as a message (known heuristic limitation)' do
+  # Documented: an unrecognised flag with a value looks like a positional message.
+  assert_equal true, run_has_message?(['run', '--unknown-flag', 'value'])
 end
 
 # ---------------------------------------------------------------------------

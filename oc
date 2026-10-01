@@ -279,10 +279,12 @@ end
 
 
 # Atomically write content to a file (write temp file in the same dir, then
-# rename). Preserves an existing target's permissions, fsyncs the temp file
-# before renaming, and cleans up a leftover temp file if anything fails.
+# rename). Preserves an existing target's permissions, fsyncs the temp file and
+# the parent directory before/after renaming, and cleans up a leftover temp file
+# if anything fails.
 def atomic_write(path, content)
   tmp = "#{path}.tmp.#{Process.pid}"
+  dir = File.dirname(path)
   begin
     File.open(tmp, 'w') do |f|
       f.write(content)
@@ -293,6 +295,12 @@ def atomic_write(path, content)
     # temp file's default permissions).
     File.chmod(File.stat(path).mode & 0o7777, tmp) if File.exist?(path)
     File.rename(tmp, path)
+    # fsync the directory so the rename itself survives a crash.
+    begin
+      File.open(dir, File::RDONLY) { |d| d.fsync }
+    rescue NotImplementedError, Errno::EINVAL, Errno::EACCES, Errno::EISDIR
+      # Some platforms/filesystems don't support directory fsync; ignore.
+    end
   ensure
     FileUtils.rm_f(tmp) if File.exist?(tmp)
   end
