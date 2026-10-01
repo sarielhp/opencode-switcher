@@ -220,6 +220,33 @@ def extract_model_override!(args)
   model
 end
 
+# Check if 'run' subcommand was given a message argument
+def run_has_message?(args)
+  return false if args.size <= 1
+
+  flags_with_val = %w[
+    -m --model -f --file --format -s --session
+    --agent --title --server --log-level --completions --prompt
+  ]
+
+  i = 1
+  while i < args.size
+    arg = args[i]
+    if arg == '--'
+      return i + 1 < args.size
+    end
+    if flags_with_val.include?(arg)
+      i += 2
+    elsif arg.start_with?('-')
+      i += 1
+    else
+      return true
+    end
+  end
+
+  false
+end
+
 
 # Compile and activate profile in ~/.config/opencode/opencode.json
 def compile_and_switch_profile(num_str, reload: true)
@@ -1379,7 +1406,7 @@ def install_script(target_dir_arg = nil, extra_args = [])
     puts "  oc conf install [directory] [options]"
     puts ""
     puts bold("OPTIONS:")
-    puts "  [directory]        Target directory (default: ~/.local/bin or ~/bin)"
+    puts "  [directory]        Target directory (default: ~/bin)"
     puts "  --dir <path>       Target directory"
     puts "  --prefix <path>    Target prefix (installs into <prefix>/bin)"
     puts "  -h, --help         Show this help message"
@@ -1407,26 +1434,9 @@ def install_script(target_dir_arg = nil, extra_args = [])
     i += 1
   end
 
-  # If not specified, choose best target directory from PATH or standard defaults
-  if chosen_dir.nil? || chosen_dir.strip.empty?
-    path_dirs = (ENV['PATH'] || '').split(File::PATH_SEPARATOR).map { |d| File.expand_path(d) rescue d }
-    local_bin = File.expand_path('~/.local/bin')
-    home_bin = File.expand_path('~/bin')
+  # Default target directory is ~/bin
+  chosen_dir = chosen_dir && !chosen_dir.strip.empty? ? File.expand_path(chosen_dir) : File.expand_path('~/bin')
 
-    if path_dirs.include?(local_bin)
-      chosen_dir = local_bin
-    elsif path_dirs.include?(home_bin)
-      chosen_dir = home_bin
-    elsif Dir.exist?(local_bin)
-      chosen_dir = local_bin
-    elsif Dir.exist?(home_bin)
-      chosen_dir = home_bin
-    else
-      chosen_dir = local_bin
-    end
-  else
-    chosen_dir = File.expand_path(chosen_dir)
-  end
 
   source_file = (File.realpath(__FILE__) rescue nil) || File.expand_path(__FILE__)
   unless File.exist?(source_file)
@@ -1634,8 +1644,8 @@ def print_usage
   puts "  oc conf version                    Show opencode-switcher version"
   puts ""
   puts bold("INSTALLATION:")
-  puts "  oc install                         Install oc and opencode-switcher to ~/.local/bin"
-  puts "  oc install <dir>                   Install into custom directory (e.g. ~/bin)"
+  puts "  oc install                         Install oc and opencode-switcher to ~/bin"
+  puts "  oc install <dir>                   Install into custom directory (e.g. ~/.local/bin)"
   puts ""
   puts bold("REMOTE SYNC:")
   puts "  oc ssh <remote>                    Copy oc to remote ~/bin/ and sync switcher config"
@@ -1908,9 +1918,13 @@ compile_and_switch_profile(target_profile_num)
 profile_model = profile_data['model']
 
 # 3. Model flag handling and argument transformation for OpenCode 2.0
+# If invoked as 'oc run' without a message argument, treat as wanting to start OpenCode interactively
+args.shift if args.first&.downcase == 'run' && !run_has_message?(args)
+
 subcmd = args.first&.downcase
 is_model_subcmd = subcmd && MODEL_SUBCOMMANDS.include?(subcmd)
 is_known_subcmd = subcmd && OPENCODE_SUBCOMMANDS.include?(subcmd)
+
 
 if is_model_subcmd
   has_model = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }

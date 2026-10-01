@@ -26,7 +26,7 @@ OpenCode stores its active configuration in `~/.config/opencode/opencode.json`. 
 
 ### Quick Installation
 
-Run `./oc install` from this repository to automatically copy `oc` to `~/.local/bin` (or another directory in your `PATH`), make it executable, and create the `opencode-switcher` symlink:
+Run `./oc install` from this repository to automatically copy `oc` to `~/bin` (or another directory in your `PATH`), make it executable, and create the `opencode-switcher` symlink:
 
 ```bash
 ./oc install
@@ -34,27 +34,28 @@ Run `./oc install` from this repository to automatically copy `oc` to `~/.local/
 
 You can also specify a custom target directory:
 ```bash
-./oc install ~/.local/bin
-# or
 ./oc install ~/bin
+# or
+./oc install ~/.local/bin
 ```
 
 ### Manual Installation
 
-Copy `oc` to a directory in your `PATH` (such as `~/.local/bin`) and make it executable:
+Copy `oc` to a directory in your `PATH` (such as `~/bin`) and make it executable:
 
 ```bash
-mkdir -p ~/.local/bin
-cp oc ~/.local/bin/oc
-chmod +x ~/.local/bin/oc
-ln -sf oc ~/.local/bin/opencode-switcher
+mkdir -p ~/bin
+cp oc ~/bin/oc
+chmod +x ~/bin/oc
+ln -sf oc ~/bin/opencode-switcher
 ```
 
-Ensure `~/.local/bin` is in your shell `PATH`:
+Ensure `~/bin` is in your shell `PATH`:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/bin:$PATH"
 ```
+
 
 ---
 
