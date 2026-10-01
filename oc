@@ -161,8 +161,68 @@ def compile_profile_config(num_str)
   deep_merge(base_cfg, prof_cfg)
 end
 
+# Locate opencode binary
+def locate_opencode_bin
+  bin = ENV['OPENCODE_BIN'] || `which opencode 2>/dev/null`.strip
+  bin = File.expand_path('~/.opencode/bin/opencode') if bin.empty? || !File.exist?(bin)
+  File.exist?(bin) ? bin : nil
+end
+
+# Load environment variables from a profile's API_key.sh into ENV
+def load_profile_env(num_str)
+  num = format_num(num_str)
+  return unless num
+
+  api_script = File.join(SWITCH_DIR, num.to_s, 'API_key.sh')
+  return unless File.exist?(api_script)
+
+  cmd = "set -a; source '#{api_script}' >/dev/null 2>&1; env -0"
+  env_out, status = Open3.capture2('bash', '-c', cmd)
+  return unless status.success?
+
+  env_out.split("\0").each do |pair|
+    k, v = pair.split('=', 2)
+    ENV[k] = v if k && !k.empty?
+  end
+end
+
+# Reload or restart running OpenCode service (if running in OpenCode 2.0)
+def reload_opencode_service(restart: false)
+  bin = locate_opencode_bin
+  return unless bin
+
+  status_out, status = Open3.capture2(bin, 'service', 'status') rescue nil
+  return unless status&.success? && status_out.to_s.strip =~ %r{^https?://}
+
+  action = restart ? 'restart' : 'reload'
+  Open3.capture2(bin, 'service', action) rescue nil
+end
+
+# Extract and remove -m/--model flag from CLI arguments
+def extract_model_override!(args)
+  model = nil
+  indices = []
+
+  args.each_with_index do |arg, idx|
+    if (arg == '-m' || arg == '--model') && idx + 1 < args.size
+      model = args[idx + 1]
+      indices = [idx, idx + 1]
+      break
+    end
+    if arg.start_with?('-m=', '--model=')
+      model = arg.split('=', 2).last
+      indices = [idx]
+      break
+    end
+  end
+
+  indices.reverse_each { |i| args.delete_at(i) }
+  model
+end
+
+
 # Compile and activate profile in ~/.config/opencode/opencode.json
-def compile_and_switch_profile(num_str)
+def compile_and_switch_profile(num_str, reload: true)
   num = format_num(num_str)
   profile_dir = File.join(SWITCH_DIR, num.to_s)
   unless num && Dir.exist?(profile_dir)
@@ -171,6 +231,7 @@ def compile_and_switch_profile(num_str)
     exit 1
   end
 
+  load_profile_env(num)
   final_cfg = compile_profile_config(num)
   if final_cfg.empty?
     warn red("Error: Profile '#{num}' configuration is empty or could not be parsed.")
@@ -183,8 +244,10 @@ def compile_and_switch_profile(num_str)
   File.write(TARGET_CFG, JSON.pretty_generate(final_cfg))
 
   File.write(DEFAULT_FILE, JSON.pretty_generate({ 'default' => num }))
+  reload_opencode_service(restart: true) if reload
   final_cfg
 end
+
 
 # Set default profile number in default.json and compile active config
 def set_default_profile(num_str)
@@ -797,7 +860,7 @@ def test_profile(num_str = nil, custom_prompt = nil)
   compile_and_switch_profile(num)
 
   prompt = custom_prompt || "Respond with exact text: Hello from Profile #{num}"
-  test_cmd = ['opencode', 'run', prompt, '-m', model]
+  test_cmd = ['opencode', 'run', '--standalone', '-m', model, prompt]
 
   start_t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   merged_env = ENV.to_h.merge(custom_env)
@@ -1746,12 +1809,14 @@ def dispatch_config_command(args)
   end
 end
 
-# OpenCode subcommands that do not take -m
-STANDALONE_COMMANDS = %w[
-  completion acp mcp attach debug providers auth agent
-  upgrade uninstall serve web models stats export import
-  github pr session plugin plug db
+# OpenCode subcommands
+OPENCODE_SUBCOMMANDS = %w[
+  upgrade update uninstall acp api debug auth mcp plugin
+  models stats mini run session service reload pair serve
+  completion attach providers agent web export import github pr plug db
 ].freeze
+
+MODEL_SUBCOMMANDS = %w[run mini].freeze
 
 # ----------------------------------------------------
 # Main Execution Dispatcher
@@ -1835,51 +1900,57 @@ unless Dir.exist?(profile_dir)
 end
 
 # 1. Source API_key.sh and inject variables into ENV
-api_script = File.join(profile_dir, 'API_key.sh')
-if File.exist?(api_script)
-  cmd = "set -a; source '#{api_script}' >/dev/null 2>&1; env -0"
-  env_out, status = Open3.capture2('bash', '-c', cmd)
-  if status.success?
-    env_out.split("\0").each do |pair|
-      k, v = pair.split('=', 2)
-      ENV[k] = v if k && !k.empty?
-    end
-  else
-    warn yellow("Warning: Failed to execute #{api_script}")
-  end
-end
+load_profile_env(target_profile_num)
 
 # 2. Compile and activate effective configuration in ~/.config/opencode/opencode.json
 profile_data = compile_profile_config(target_profile_num)
 compile_and_switch_profile(target_profile_num)
 profile_model = profile_data['model']
 
-# 3. Handle model forwarding if not explicitly supplied
-has_model_flag = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }
-is_subcommand = args.first && STANDALONE_COMMANDS.include?(args.first.downcase)
+# 3. Model flag handling and argument transformation for OpenCode 2.0
+subcmd = args.first&.downcase
+is_model_subcmd = subcmd && MODEL_SUBCOMMANDS.include?(subcmd)
+is_known_subcmd = subcmd && OPENCODE_SUBCOMMANDS.include?(subcmd)
 
-# Check if config has agent-specific models - if so, use build agent model for run
-if profile_data && profile_data['agent'].is_a?(Hash)
-  has_agent_models = profile_data['agent'].values.any? { |a| a.is_a?(Hash) && a['model'] }
-  if has_agent_models && profile_data['agent']['build'].is_a?(Hash) && profile_data['agent']['build']['model']
-    profile_model = profile_data['agent']['build']['model']
+if is_model_subcmd
+  has_model = args.any? { |a| a == '-m' || a == '--model' || a.start_with?('-m=') || a.start_with?('--model=') }
+  args.insert(1, '-m', profile_model) if !has_model && profile_model
+elsif is_known_subcmd
+  # Subcommand does not accept -m; do not inject model flags
+else
+  # Root interactive TUI invocation: opencode [flags] [<directory>]
+  # Extract any user-specified model override flag since root OpenCode 2.0 does not accept -m
+  model_override = extract_model_override!(args)
+  if model_override
+    profile_model = model_override
+    profile_data['model'] = model_override
+    if profile_data['agent'].is_a?(Hash)
+      profile_data['agent'].each_value do |agent_cfg|
+        agent_cfg['model'] = model_override if agent_cfg.is_a?(Hash) && agent_cfg['model']
+      end
+    end
+    File.write(TARGET_CFG, JSON.pretty_generate(profile_data))
+    reload_opencode_service(restart: true)
+  end
+
+  # Check if arguments contain a positional prompt rather than a directory or flag
+  if args.any? && !args.first.start_with?('-') && !File.directory?(args.first)
+    has_prompt_flag = args.any? { |a| a == '--prompt' || a.start_with?('--prompt=') }
+    unless has_prompt_flag
+      prompt_parts = []
+      prompt_parts << args.shift while args.any? && !args.first.start_with?('-') && !File.directory?(args.first)
+      args.unshift('--prompt', prompt_parts.join(' ')) unless prompt_parts.empty?
+    end
   end
 end
 
-if profile_model && !has_model_flag && !is_subcommand
-  args.unshift('-m', profile_model)
-end
-
 # 4. Locate and execute opencode binary
-opencode_bin = ENV['OPENCODE_BIN'] ||
-               `which opencode 2>/dev/null`.strip
-
-opencode_bin = File.expand_path('~/.opencode/bin/opencode') if opencode_bin.empty? || !File.exist?(opencode_bin)
-
-unless File.exist?(opencode_bin)
+opencode_bin = locate_opencode_bin
+unless opencode_bin
   warn red("Error: Could not locate 'opencode' binary.")
   exit 1
 end
 
 $stderr.puts cyan("[oc] Active Profile: #{bold(target_profile_num)} | Model: #{bold(profile_model || '(default)')}")
 exec(opencode_bin, *args)
+
