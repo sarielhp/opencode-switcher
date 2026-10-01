@@ -278,14 +278,49 @@ def run_has_message?(args)
 end
 
 
-# Atomically write content to a file (write temp file in the same dir, then rename)
+# Atomically write content to a file (write temp file in the same dir, then
+# rename). Preserves an existing target's permissions, fsyncs the temp file
+# before renaming, and cleans up a leftover temp file if anything fails.
 def atomic_write(path, content)
   tmp = "#{path}.tmp.#{Process.pid}"
   begin
-    File.write(tmp, content)
+    File.open(tmp, 'w') do |f|
+      f.write(content)
+      f.flush
+      f.fsync
+    end
+    # Preserve the target's existing mode (File.rename would otherwise use the
+    # temp file's default permissions).
+    File.chmod(File.stat(path).mode & 0o7777, tmp) if File.exist?(path)
     File.rename(tmp, path)
   ensure
     FileUtils.rm_f(tmp) if File.exist?(tmp)
+  end
+end
+
+# Remove stale atomic_write temp files left behind by a crashed/killed run.
+def sweep_stale_tmp_files
+  Dir.glob(File.join(SWITCH_DIR, '*.tmp.*')).each do |f|
+    pid = f[/\.tmp\.(\d+)\z/, 1]
+    next unless pid
+    begin
+      Process.kill(0, pid.to_i)
+    rescue Errno::ESRCH
+      FileUtils.rm_f(f) # process no longer exists
+    rescue Errno::EPERM
+      # process exists but is owned by another user; leave it alone
+    end
+  end
+  Dir.glob(File.join(OPENCODE_DIR, '*.tmp.*')).each do |f|
+    pid = f[/\.tmp\.(\d+)\z/, 1]
+    next unless pid
+    begin
+      Process.kill(0, pid.to_i)
+    rescue Errno::ESRCH
+      FileUtils.rm_f(f)
+    rescue Errno::EPERM
+      # ignore
+    end
   end
 end
 
@@ -335,7 +370,7 @@ def detect_api_env_vars(json_data)
           v.each do |p_name, p_val|
             search_obj.call(p_val, p_name)
           end
-        elsif k.to_s =~ /apiKey/i
+        elsif k.to_s =~ /\AapiKey\z/i
           if v.is_a?(String)
             if v =~ /\{env:([^}]+)\}/
               vars << $1.strip
@@ -379,7 +414,7 @@ def inject_env_placeholders!(json_data, env_var_map, only: nil)
           v.each do |p_name, p_val|
             update_obj.call(p_val, p_name)
           end
-        elsif k.to_s =~ /apiKey/i && v.is_a?(String)
+        elsif k.to_s =~ /\AapiKey\z/i && v.is_a?(String)
           if v !~ /\{env:[^}]+\}/ && (only.nil? || only.include?(provider_name))
             var = env_var_map[provider_name] ||
                   "#{provider_name.to_s.upcase.gsub(/[^A-Z0-9]/, '_')}_API_KEY"
@@ -681,6 +716,11 @@ def set_api_key(num_str, api_key_value)
 
   unless num && Dir.exist?(profile_dir)
     warn red("Error: Profile '#{num_str}' does not exist.")
+    exit 1
+  end
+
+  if api_key_value.to_s.include?("\0")
+    warn red("Error: API key must not contain NUL bytes.")
     exit 1
   end
 
@@ -1910,6 +1950,7 @@ MODEL_SUBCOMMANDS = %w[run mini].freeze
 # Main Execution Dispatcher
 # ----------------------------------------------------
 ensure_initialized
+sweep_stale_tmp_files
 
 args = ARGV.dup
 program_basename = File.basename($PROGRAM_NAME)

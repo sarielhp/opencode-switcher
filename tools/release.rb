@@ -112,8 +112,12 @@ else
   puts yellow("  Skipping main fast-forward (current branch is '#{current_branch}', not 'dev')")
 end
 
-# 4. Publish a GitHub release (also creates the tag)
-gh('release', 'create', "v#{new_version}", '--title', "v#{new_version}", '--generate-notes')
-puts green("  ✓ Released v#{new_version} on GitHub")
+# 4. Publish a GitHub release (also creates the tag).
+# Pin the tag to the exact commit we just pushed (HEAD) so it never points at a
+# stale default-branch HEAD when releasing from a non-dev branch.
+release_sha = git('rev-parse', 'HEAD').strip
+gh('release', 'create', "v#{new_version}", '--title', "v#{new_version}",
+   '--target', release_sha, '--generate-notes')
+puts green("  ✓ Released v#{new_version} on GitHub (target #{release_sha[0, 8]})")
 
 puts bold("Done: v#{old_version} -> v#{new_version}")
