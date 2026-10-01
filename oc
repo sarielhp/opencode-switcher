@@ -8,7 +8,7 @@ require 'net/http'
 require 'uri'
 require 'shellwords'
 
-VERSION      = '0.1.3'
+VERSION      = '0.1.4'
 SWITCH_DIR   = File.expand_path('~/.config/opencode-switcher')
 LEGACY_DIRS  = [
   File.expand_path('~/.config/opencode_switch'),
